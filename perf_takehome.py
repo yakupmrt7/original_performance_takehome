@@ -84,11 +84,11 @@ class KernelBuilder:
         s_idx = self.alloc_scratch("s_idx", batch_size)   # 256 words for indices
         s_val = self.alloc_scratch("s_val", batch_size)   # 256 words for values
 
-        # Vector temporaries - 2 sets for pipeline interleaving
+        # Vector temporaries - 3 sets for pipeline interleaving (5-cycle spacing)
         s_nv = self.alloc_scratch("s_nv", VL)             # gathered node values
-        s_vt1 = [self.alloc_scratch(f"svt1_{i}", VL) for i in range(2)]
-        s_vt2 = [self.alloc_scratch(f"svt2_{i}", VL) for i in range(2)]
-        s_idx2p1 = [self.alloc_scratch(f"si2p1_{i}", VL) for i in range(2)]
+        s_vt1 = [self.alloc_scratch(f"svt1_{i}", VL) for i in range(3)]
+        s_vt2 = [self.alloc_scratch(f"svt2_{i}", VL) for i in range(3)]
+        s_idx2p1 = [self.alloc_scratch(f"si2p1_{i}", VL) for i in range(3)]
         s_vbit = self.alloc_scratch("s_vbit", VL)
         s_vidxn = self.alloc_scratch("s_vidxn", VL)
         s_vcmp = self.alloc_scratch("s_vcmp", VL)
@@ -198,17 +198,17 @@ class KernelBuilder:
         """
         Emit pipelined instructions for all groups.
         Overlaps gather of next group with hash of current group.
-        Uses 2 sets of hash temporaries (A/B) alternating by group.
-        Pipeline spacing: 6 cycles between consecutive groups.
+        Uses 3 sets of hash temporaries alternating by group.
+        Pipeline spacing: 5 cycles between consecutive groups.
         idx2p1 computed at cycles 16-17 (during last hash stage) to avoid
         being overwritten by later groups sharing the same buffer set.
         """
-        SPACING = 6
+        SPACING = 5
 
         def group_ops(g, start_cycle):
             vi = s_idx + g * VL
             vv = s_val + g * VL
-            buf = g % 2
+            buf = g % 3
             vt1 = s_vt1[buf]
             vt2 = s_vt2[buf]
             vidx2p1 = s_idx2p1[buf]
