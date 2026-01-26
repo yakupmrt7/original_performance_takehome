@@ -48,8 +48,7 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
+    def build(self, slots, vliw=False):
         instrs = []
         for engine, slot in slots:
             instrs.append({engine: [slot]})
@@ -58,13 +57,16 @@ class KernelBuilder:
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
 
+    def emit(self, bundle):
+        self.instrs.append(bundle)
+
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
         if name is not None:
             self.scratch[name] = addr
             self.scratch_debug[addr] = (name, length)
         self.scratch_ptr += length
-        assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
+        assert self.scratch_ptr <= SCRATCH_SIZE, f"Out of scratch space: {self.scratch_ptr} > {SCRATCH_SIZE}"
         return addr
 
     def scratch_const(self, val, name=None):
@@ -74,104 +76,189 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
+    def build_kernel(self, forest_height, n_nodes, batch_size, rounds):
+        VL = VLEN  # 8
+        n_groups = batch_size // VL  # 32
 
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+        # === SCRATCH ALLOCATION ===
+        s_idx = self.alloc_scratch("s_idx", batch_size)   # 256 words for indices
+        s_val = self.alloc_scratch("s_val", batch_size)   # 256 words for values
 
-        return slots
+        # Vector temporaries - 2 sets for pipeline interleaving
+        s_nv = self.alloc_scratch("s_nv", VL)             # gathered node values
+        s_vt1 = [self.alloc_scratch(f"svt1_{i}", VL) for i in range(2)]
+        s_vt2 = [self.alloc_scratch(f"svt2_{i}", VL) for i in range(2)]
+        s_idx2p1 = [self.alloc_scratch(f"si2p1_{i}", VL) for i in range(2)]
+        s_vbit = self.alloc_scratch("s_vbit", VL)
+        s_vidxn = self.alloc_scratch("s_vidxn", VL)
+        s_vcmp = self.alloc_scratch("s_vcmp", VL)
+        s_ga = self.alloc_scratch("s_ga", VL)             # 8 gather address regs
 
-    def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
-    ):
+        # Vector constants
+        s_v1 = self.alloc_scratch("s_v1", VL)
+        s_v0 = self.alloc_scratch("s_v0", VL)
+        s_vnn = self.alloc_scratch("s_vnn", VL)
+
+        # Hash constant vectors
+        s_hc = []
+        s_hs = []
+        for hi in range(len(HASH_STAGES)):
+            s_hc.append(self.alloc_scratch(f"shc{hi}", VL))
+            s_hs.append(self.alloc_scratch(f"shs{hi}", VL))
+
+        # Scalar registers
+        s_fvp = self.alloc_scratch("sfvp")
+        s_iip = self.alloc_scratch("siip")
+        s_ivp = self.alloc_scratch("sivp")
+        s_rc = self.alloc_scratch("src")
+        s_one = self.alloc_scratch("sone")
+        s_zero = self.alloc_scratch("szero")
+        s_nn = self.alloc_scratch("snn")
+        s_rounds_s = self.alloc_scratch("srounds")
+        s_tmp = self.alloc_scratch("stmp")
+        s_tmp2 = self.alloc_scratch("stmp2")
+        s_addr = self.alloc_scratch("saddr")
+        s_addr2 = self.alloc_scratch("saddr2")
+        s_cond = self.alloc_scratch("scond")
+        s_vlen_s = self.alloc_scratch("svlen")
+
+        # === INITIALIZATION ===
+        # Load scalar constants
+        self.emit({"load": [("const", s_zero, 0), ("const", s_one, 1)]})
+        # Load header from memory using addresses 0,1,4,5,6
+        self.emit({"load": [("const", s_tmp, 4), ("const", s_tmp2, 5)]})
+        self.emit({"load": [("load", s_rounds_s, s_zero), ("load", s_nn, s_one)]})
+        self.emit({"load": [("load", s_fvp, s_tmp), ("load", s_iip, s_tmp2)]})
+        self.emit({"load": [("const", s_tmp, 6), ("const", s_vlen_s, VL)]})
+        self.emit({"load": [("load", s_ivp, s_tmp)]})
+
+        # Broadcast vector constants + pipeline hash const loading
+        self.emit({"valu": [("vbroadcast", s_v1, s_one),
+                            ("vbroadcast", s_v0, s_zero),
+                            ("vbroadcast", s_vnn, s_nn)],
+                   "load": [("const", s_tmp, HASH_STAGES[0][1] % (2**32)),
+                            ("const", s_tmp2, HASH_STAGES[0][4])]})
+        for hi in range(len(HASH_STAGES)):
+            if hi + 1 < len(HASH_STAGES):
+                self.emit({"valu": [("vbroadcast", s_hc[hi], s_tmp),
+                                    ("vbroadcast", s_hs[hi], s_tmp2)],
+                           "load": [("const", s_tmp, HASH_STAGES[hi+1][1] % (2**32)),
+                                    ("const", s_tmp2, HASH_STAGES[hi+1][4])]})
+            else:
+                self.emit({"valu": [("vbroadcast", s_hc[hi], s_tmp),
+                                    ("vbroadcast", s_hs[hi], s_tmp2)]})
+
+        # Load indices and values from memory into scratch
+        self.emit({"alu": [("+", s_addr, s_iip, s_zero),
+                           ("+", s_addr2, s_ivp, s_zero)]})
+        for g in range(n_groups):
+            bundle = {"load": [("vload", s_idx + g * VL, s_addr),
+                               ("vload", s_val + g * VL, s_addr2)]}
+            if g < n_groups - 1:
+                bundle["alu"] = [("+", s_addr, s_addr, s_vlen_s),
+                                 ("+", s_addr2, s_addr2, s_vlen_s)]
+            self.emit(bundle)
+
+        # Pause for reference kernel yield sync
+        self.emit({"flow": [("pause",)]})
+
+        # === MAIN LOOP over rounds ===
+        self.emit({"load": [("const", s_rc, 0)]})
+        loop_start = len(self.instrs)
+
+        # Process all groups (unrolled) with inter-group pipeline
+        # Schedule: overlap gather of group g+1 with hash of group g
+        self._emit_pipelined_groups(
+            n_groups, VL, s_idx, s_val, s_nv, s_vt1, s_vt2,
+            s_idx2p1, s_vbit, s_vidxn, s_vcmp, s_ga,
+            s_v1, s_v0, s_vnn, s_hc, s_hs, s_fvp)
+
+        # Round loop
+        self.emit({"alu": [("+", s_rc, s_rc, s_one)]})
+        self.emit({"alu": [("<", s_cond, s_rc, s_rounds_s)]})
+        self.emit({"flow": [("cond_jump", s_cond, loop_start)]})
+
+        # === STORE results back to memory (2 vstores per cycle) ===
+        self.emit({"alu": [("+", s_addr, s_ivp, s_zero),
+                           ("+", s_tmp, s_vlen_s, s_vlen_s)]})  # s_tmp = 2*VL
+        self.emit({"alu": [("+", s_addr2, s_addr, s_vlen_s)]})  # s_addr2 = ivp+VL
+        for g in range(0, n_groups, 2):
+            bundle = {"store": [("vstore", s_addr, s_val + g * VL),
+                                ("vstore", s_addr2, s_val + (g + 1) * VL)]}
+            if g + 2 < n_groups:
+                bundle["alu"] = [("+", s_addr, s_addr, s_tmp),
+                                 ("+", s_addr2, s_addr2, s_tmp)]
+            self.emit(bundle)
+
+        self.emit({"flow": [("pause",)]})
+
+    def _emit_pipelined_groups(self, n_groups, VL, s_idx, s_val, s_nv,
+                                s_vt1, s_vt2, s_idx2p1, s_vbit, s_vidxn,
+                                s_vcmp, s_ga, s_v1, s_v0, s_vnn, s_hc, s_hs, s_fvp):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Emit pipelined instructions for all groups.
+        Overlaps gather of next group with hash of current group.
+        Uses 2 sets of hash temporaries (A/B) alternating by group.
+        Pipeline spacing: 6 cycles between consecutive groups.
+        idx2p1 computed at cycles 16-17 (during last hash stage) to avoid
+        being overwritten by later groups sharing the same buffer set.
         """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        SPACING = 6
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        def group_ops(g, start_cycle):
+            vi = s_idx + g * VL
+            vv = s_val + g * VL
+            buf = g % 2
+            vt1 = s_vt1[buf]
+            vt2 = s_vt2[buf]
+            vidx2p1 = s_idx2p1[buf]
+            ops = []
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+            # Cycle 0: ALU addr compute (8 ALU slots)
+            ops.append((start_cycle, "alu", [("+", s_ga + i, s_fvp, vi + i) for i in range(VL)]))
+            # Cycles 1-4: Load gather (2 loads per cycle)
+            for c in range(4):
+                ops.append((start_cycle + 1 + c, "load", [
+                    ("load", s_nv + 2*c, s_ga + 2*c),
+                    ("load", s_nv + 2*c + 1, s_ga + 2*c + 1)
+                ]))
+            # Cycle 5: VALU XOR val ^= node_val
+            ops.append((start_cycle + 5, "valu", [("^", vv, vv, s_nv)]))
+            # Cycles 6-17: Hash (6 stages × 2 cycles each)
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                valu_tmp = [(op1, vt1, vv, s_hc[hi]), (op3, vt2, vv, s_hs[hi])]
+                valu_val = [(op2, vv, vt1, vt2)]
+                # Last hash stage (hi=5, cycles 16-17): also compute idx2, idx2p1
+                if hi == 5:
+                    valu_tmp.append(("+", vidx2p1, vi, vi))       # idx2 = idx + idx
+                    valu_val.append(("+", vidx2p1, vidx2p1, s_v1)) # idx2p1 = idx2 + 1
+                ops.append((start_cycle + 6 + hi * 2, "valu", valu_tmp))
+                ops.append((start_cycle + 7 + hi * 2, "valu", valu_val))
+            # Cycle 18: bit = val & 1
+            ops.append((start_cycle + 18, "valu", [("&", s_vbit, vv, s_v1)]))
+            # Cycle 19: idx_new = idx2p1 + bit
+            ops.append((start_cycle + 19, "valu", [("+", s_vidxn, vidx2p1, s_vbit)]))
+            # Cycle 20: cmp = idx_new < n_nodes
+            ops.append((start_cycle + 20, "valu", [("<", s_vcmp, s_vidxn, s_vnn)]))
+            # Cycle 21: vselect idx = cmp ? idx_new : 0
+            ops.append((start_cycle + 21, "flow", [("vselect", vi, s_vcmp, s_vidxn, s_v0)]))
+            return ops
 
-        body = []  # array of slots
+        starts = [g * SPACING for g in range(n_groups)]
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        all_ops = []
+        for g in range(n_groups):
+            all_ops.extend(group_ops(g, starts[g]))
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+        max_cycle = max(cycle for cycle, _, _ in all_ops) + 1
+        schedule = [defaultdict(list) for _ in range(max_cycle)]
+        for cycle, engine, slots in all_ops:
+            schedule[cycle][engine].extend(slots)
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+        for cycle_bundle in schedule:
+            if cycle_bundle:
+                self.emit(dict(cycle_bundle))
+
 
 BASELINE = 147734
 
@@ -191,7 +278,6 @@ def do_kernel_test(
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
-    # print(kb.instrs)
 
     value_trace = {}
     machine = Machine(
@@ -217,8 +303,6 @@ def do_kernel_test(
         if prints:
             print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
             print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-        # Updating these in memory isn't required, but you can enable this check for debugging
-        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
@@ -227,9 +311,6 @@ def do_kernel_test(
 
 class Tests(unittest.TestCase):
     def test_ref_kernels(self):
-        """
-        Test the reference kernels against each other
-        """
         random.seed(123)
         for i in range(10):
             f = Tree.generate(4)
@@ -242,34 +323,11 @@ class Tests(unittest.TestCase):
             assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
 
     def test_kernel_trace(self):
-        # Full-scale example for performance testing
         do_kernel_test(10, 16, 256, trace=True, prints=False)
-
-    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
-    # You can uncomment this if you think it might help you debug
-    # def test_kernel_correctness(self):
-    #     for batch in range(1, 3):
-    #         for forest_height in range(3):
-    #             do_kernel_test(
-    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
-    #             )
 
     def test_kernel_cycles(self):
         do_kernel_test(10, 16, 256)
 
-
-# To run all the tests:
-#    python perf_takehome.py
-# To run a specific test:
-#    python perf_takehome.py Tests.test_kernel_cycles
-# To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
-# NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
-#    python perf_takehome.py Tests.test_kernel_trace
-# Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
-# You can then keep that open and re-run the test to see a new trace.
-
-# To run the proper checks to see which thresholds you pass:
-#    python tests/submission_tests.py
 
 if __name__ == "__main__":
     unittest.main()
