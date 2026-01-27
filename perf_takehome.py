@@ -163,10 +163,8 @@ class KernelBuilder:
         self.emit({"flow": [("pause",)]})
 
         # === UNROLLED ROUNDS with overlap (submission tests have pause disabled) ===
-        # Each round pipeline is 143 cycles (groups 0-31 at spacing 4, last ends at 124+19=143)
-        # Space rounds 128 cycles apart to avoid load conflicts (group 31 loads at 125-128)
-        # This gives (143-128)*15 = 225 cycle savings vs sequential
-        self._emit_overlapped_rounds(
+        # Standard gather-based approach (level-aware optimization not viable with current ISA)
+        self._emit_level_aware_rounds(
             rounds, n_groups, VL, s_idx, s_val, s_nv, s_vt1, s_vt2,
             s_idx2p1, s_vbit, s_vidxn, s_vcmp, s_ga,
             s_v1, s_v0, s_vnn, s_hc, s_hs, s_fvp)
@@ -259,6 +257,95 @@ class KernelBuilder:
         for cycle_bundle in schedule:
             if cycle_bundle:
                 self.emit(dict(cycle_bundle))
+
+    def _emit_level_aware_rounds(self, rounds, n_groups, VL, s_idx, s_val, s_nv,
+                                 s_vt1, s_vt2, s_idx2p1, s_vbit, s_vidxn,
+                                 s_vcmp, s_ga, s_v1, s_v0, s_vnn,
+                                 s_hc, s_hs, s_fvp):
+        """
+        Emit all rounds unrolled with standard gather approach.
+
+        NOTE: Initially attempted level-aware optimization (preload tree levels 0-7)
+        but ISA constraints prevent efficient implementation:
+        1. Cannot load from scratch (only from memory)
+        2. Cannot efficiently select from cached values without gather
+        3. Slot limits prevent aggressive packing even when skipping gather
+
+        For Round 0 optimization (all idx=0), loading tree[0] once and broadcasting
+        still requires spacing >=5 to avoid VALU slot violations, saving minimal cycles.
+
+        Future: Requires ISA extensions (scratch-to-scratch gather, fused ops)
+        """
+        SPACING = 4
+        ROUND_DELAY = 128  # cycles between round starts
+
+        # Generate all operations for all rounds using standard gather
+        all_ops = []
+        for r in range(rounds):
+            round_start = r * ROUND_DELAY
+            for g in range(n_groups):
+                group_start = round_start + g * SPACING
+                all_ops.extend(self._group_ops_gather(g, group_start, VL, s_idx, s_val,
+                                                      s_nv, s_vt1, s_vt2, s_idx2p1, s_vbit,
+                                                      s_vidxn, s_vcmp, s_ga, s_v1, s_v0,
+                                                      s_vnn, s_hc, s_hs, s_fvp))
+
+        # Schedule all operations
+        max_cycle = max(cycle for cycle, _, _ in all_ops) + 1
+        schedule = [defaultdict(list) for _ in range(max_cycle)]
+        for cycle, engine, slots in all_ops:
+            schedule[cycle][engine].extend(slots)
+
+        # Emit the schedule
+        for cycle_bundle in schedule:
+            if cycle_bundle:
+                self.emit(dict(cycle_bundle))
+
+    def _group_ops_gather(self, g, start_cycle, VL, s_idx, s_val, s_nv, s_vt1, s_vt2,
+                         s_idx2p1, s_vbit, s_vidxn, s_vcmp, s_ga, s_v1, s_v0, s_vnn,
+                         s_hc, s_hs, s_fvp):
+        """
+        Group operations using traditional gather from memory.
+        """
+        vi = s_idx + g * VL
+        vv = s_val + g * VL
+        buf = g % 3
+        vt1 = s_vt1[buf]
+        vt2 = s_vt2[buf]
+        vidx2p1 = s_idx2p1[buf]
+        ops = []
+
+        # Cycle 0: ALU addr compute (8 ALU slots)
+        ops.append((start_cycle, "alu", [("+", s_ga + i, s_fvp, vi + i) for i in range(VL)]))
+        # Cycles 1-4: Load gather (2 loads per cycle)
+        for c in range(4):
+            ops.append((start_cycle + 1 + c, "load", [
+                ("load", s_nv + 2*c, s_ga + 2*c),
+                ("load", s_nv + 2*c + 1, s_ga + 2*c + 1)
+            ]))
+        # Cycle 5: VALU XOR val ^= node_val
+        ops.append((start_cycle + 5, "valu", [("^", vv, vv, s_nv)]))
+        # Cycles 6-14: Hash (6 stages, stages 0,2,4 use multiply_add = 1 cycle, others = 2 cycles)
+        cycle_offset = 6
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            if hi in [0, 2, 4] and op1 == "+" and op2 == "+" and op3 == "<<":
+                ops.append((start_cycle + cycle_offset, "valu", [("multiply_add", vv, vv, s_hs[hi], s_hc[hi])]))
+                cycle_offset += 1
+            else:
+                valu_tmp = [(op1, vt1, vv, s_hc[hi]), (op3, vt2, vv, s_hs[hi])]
+                valu_val = [(op2, vv, vt1, vt2)]
+                if hi == 5:
+                    valu_tmp.append(("+", vidx2p1, vi, vi))
+                    valu_val.append(("+", vidx2p1, vidx2p1, s_v1))
+                ops.append((start_cycle + cycle_offset, "valu", valu_tmp))
+                ops.append((start_cycle + cycle_offset + 1, "valu", valu_val))
+                cycle_offset += 2
+        # Cycle 15-18: bit extraction and index update
+        ops.append((start_cycle + 15, "valu", [("&", s_vbit, vv, s_v1)]))
+        ops.append((start_cycle + 16, "valu", [("+", s_vidxn, vidx2p1, s_vbit)]))
+        ops.append((start_cycle + 17, "valu", [("<", s_vcmp, s_vidxn, s_vnn)]))
+        ops.append((start_cycle + 18, "flow", [("vselect", vi, s_vcmp, s_vidxn, s_v0)]))
+        return ops
 
     def _emit_overlapped_rounds(self, rounds, n_groups, VL, s_idx, s_val, s_nv,
                                  s_vt1, s_vt2, s_idx2p1, s_vbit, s_vidxn,
