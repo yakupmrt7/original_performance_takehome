@@ -84,11 +84,11 @@ class KernelBuilder:
         s_idx = self.alloc_scratch("s_idx", batch_size)   # 256 words for indices
         s_val = self.alloc_scratch("s_val", batch_size)   # 256 words for values
 
-        # Vector temporaries - 5 sets for pipeline interleaving (4-cycle spacing)
+        # Vector temporaries - 3 sets minimum for pipeline interleaving
         s_nv = self.alloc_scratch("s_nv", VL)             # gathered node values
-        s_vt1 = [self.alloc_scratch(f"svt1_{i}", VL) for i in range(5)]
-        s_vt2 = [self.alloc_scratch(f"svt2_{i}", VL) for i in range(5)]
-        s_idx2p1 = [self.alloc_scratch(f"si2p1_{i}", VL) for i in range(5)]
+        s_vt1 = [self.alloc_scratch(f"svt1_{i}", VL) for i in range(3)]
+        s_vt2 = [self.alloc_scratch(f"svt2_{i}", VL) for i in range(3)]
+        s_idx2p1 = [self.alloc_scratch(f"si2p1_{i}", VL) for i in range(3)]
         s_vbit = self.alloc_scratch("s_vbit", VL)
         s_vidxn = self.alloc_scratch("s_vidxn", VL)
         s_vcmp = self.alloc_scratch("s_vcmp", VL)
@@ -110,27 +110,21 @@ class KernelBuilder:
         s_fvp = self.alloc_scratch("sfvp")
         s_iip = self.alloc_scratch("siip")
         s_ivp = self.alloc_scratch("sivp")
-        s_rc = self.alloc_scratch("src")
         s_one = self.alloc_scratch("sone")
         s_zero = self.alloc_scratch("szero")
         s_nn = self.alloc_scratch("snn")
-        s_rounds_s = self.alloc_scratch("srounds")
         s_tmp = self.alloc_scratch("stmp")
         s_tmp2 = self.alloc_scratch("stmp2")
         s_addr = self.alloc_scratch("saddr")
         s_addr2 = self.alloc_scratch("saddr2")
-        s_cond = self.alloc_scratch("scond")
         s_vlen_s = self.alloc_scratch("svlen")
 
         # === INITIALIZATION ===
-        # Load scalar constants
         self.emit({"load": [("const", s_zero, 0), ("const", s_one, 1)]})
-        # Load header from memory using addresses 0,1,4,5,6
         self.emit({"load": [("const", s_tmp, 4), ("const", s_tmp2, 5)]})
-        self.emit({"load": [("load", s_rounds_s, s_zero), ("load", s_nn, s_one)]})
-        self.emit({"load": [("load", s_fvp, s_tmp), ("load", s_iip, s_tmp2)]})
-        self.emit({"load": [("const", s_tmp, 6), ("const", s_vlen_s, VL)]})
-        self.emit({"load": [("load", s_ivp, s_tmp)]})
+        self.emit({"load": [("const", s_addr, 6), ("const", s_vlen_s, VL)]})
+        self.emit({"load": [("load", s_nn, s_one), ("load", s_fvp, s_tmp)]})
+        self.emit({"load": [("load", s_iip, s_tmp2), ("load", s_ivp, s_addr)]})
 
         # Broadcast vector constants + pipeline hash const loading
         # For stages 0,2,4: load multipliers (1 + 2^shift) instead of shifts
@@ -179,8 +173,8 @@ class KernelBuilder:
 
         # === STORE results back to memory (2 vstores per cycle) ===
         self.emit({"alu": [("+", s_addr, s_ivp, s_zero),
-                           ("+", s_tmp, s_vlen_s, s_vlen_s)]})  # s_tmp = 2*VL
-        self.emit({"alu": [("+", s_addr2, s_addr, s_vlen_s)]})  # s_addr2 = ivp+VL
+                           ("+", s_addr2, s_ivp, s_vlen_s),
+                           ("+", s_tmp, s_vlen_s, s_vlen_s)]})  # s_addr2 = ivp+VL, s_tmp = 2*VL
         for g in range(0, n_groups, 2):
             bundle = {"store": [("vstore", s_addr, s_val + g * VL),
                                 ("vstore", s_addr2, s_val + (g + 1) * VL)]}
@@ -206,7 +200,7 @@ class KernelBuilder:
         def group_ops(g, start_cycle):
             vi = s_idx + g * VL
             vv = s_val + g * VL
-            buf = g % 5
+            buf = g % 3
             vt1 = s_vt1[buf]
             vt2 = s_vt2[buf]
             vidx2p1 = s_idx2p1[buf]
@@ -282,7 +276,7 @@ class KernelBuilder:
         def group_ops(g, start_cycle):
             vi = s_idx + g * VL
             vv = s_val + g * VL
-            buf = g % 5
+            buf = g % 3
             vt1 = s_vt1[buf]
             vt2 = s_vt2[buf]
             vidx2p1 = s_idx2p1[buf]
