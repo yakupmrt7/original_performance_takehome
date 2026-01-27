@@ -84,11 +84,11 @@ class KernelBuilder:
         s_idx = self.alloc_scratch("s_idx", batch_size)   # 256 words for indices
         s_val = self.alloc_scratch("s_val", batch_size)   # 256 words for values
 
-        # Vector temporaries - 3 sets for pipeline interleaving (5-cycle spacing)
+        # Vector temporaries - 5 sets for pipeline interleaving (4-cycle spacing)
         s_nv = self.alloc_scratch("s_nv", VL)             # gathered node values
-        s_vt1 = [self.alloc_scratch(f"svt1_{i}", VL) for i in range(3)]
-        s_vt2 = [self.alloc_scratch(f"svt2_{i}", VL) for i in range(3)]
-        s_idx2p1 = [self.alloc_scratch(f"si2p1_{i}", VL) for i in range(3)]
+        s_vt1 = [self.alloc_scratch(f"svt1_{i}", VL) for i in range(5)]
+        s_vt2 = [self.alloc_scratch(f"svt2_{i}", VL) for i in range(5)]
+        s_idx2p1 = [self.alloc_scratch(f"si2p1_{i}", VL) for i in range(5)]
         s_vbit = self.alloc_scratch("s_vbit", VL)
         s_vidxn = self.alloc_scratch("s_vidxn", VL)
         s_vcmp = self.alloc_scratch("s_vcmp", VL)
@@ -133,17 +133,23 @@ class KernelBuilder:
         self.emit({"load": [("load", s_ivp, s_tmp)]})
 
         # Broadcast vector constants + pipeline hash const loading
+        # For stages 0,2,4: load multipliers (1 + 2^shift) instead of shifts
+        stage0_mult = 1 + (1 << HASH_STAGES[0][4])  # 1 + 2^12 = 4097
         self.emit({"valu": [("vbroadcast", s_v1, s_one),
                             ("vbroadcast", s_v0, s_zero),
                             ("vbroadcast", s_vnn, s_nn)],
                    "load": [("const", s_tmp, HASH_STAGES[0][1] % (2**32)),
-                            ("const", s_tmp2, HASH_STAGES[0][4])]})
+                            ("const", s_tmp2, stage0_mult)]})
         for hi in range(len(HASH_STAGES)):
             if hi + 1 < len(HASH_STAGES):
+                next_val2 = HASH_STAGES[hi+1][4]
+                # For stages 0,2,4: compute multiplier; for others: use shift value
+                if hi+1 in [0, 2, 4] and HASH_STAGES[hi+1][0] == "+" and HASH_STAGES[hi+1][2] == "+" and HASH_STAGES[hi+1][3] == "<<":
+                    next_val2 = 1 + (1 << HASH_STAGES[hi+1][4])
                 self.emit({"valu": [("vbroadcast", s_hc[hi], s_tmp),
                                     ("vbroadcast", s_hs[hi], s_tmp2)],
                            "load": [("const", s_tmp, HASH_STAGES[hi+1][1] % (2**32)),
-                                    ("const", s_tmp2, HASH_STAGES[hi+1][4])]})
+                                    ("const", s_tmp2, next_val2)]})
             else:
                 self.emit({"valu": [("vbroadcast", s_hc[hi], s_tmp),
                                     ("vbroadcast", s_hs[hi], s_tmp2)]})
@@ -159,24 +165,17 @@ class KernelBuilder:
                                  ("+", s_addr2, s_addr2, s_vlen_s)]
             self.emit(bundle)
 
-        # Pause for reference kernel yield sync
+        # Pause for reference kernel yield sync (only for local tests, disabled in submission)
         self.emit({"flow": [("pause",)]})
 
-        # === MAIN LOOP over rounds ===
-        self.emit({"load": [("const", s_rc, 0)]})
-        loop_start = len(self.instrs)
-
-        # Process all groups (unrolled) with inter-group pipeline
-        # Schedule: overlap gather of group g+1 with hash of group g
-        self._emit_pipelined_groups(
-            n_groups, VL, s_idx, s_val, s_nv, s_vt1, s_vt2,
+        # === UNROLLED ROUNDS with overlap (submission tests have pause disabled) ===
+        # Each round pipeline is 143 cycles (groups 0-31 at spacing 4, last ends at 124+19=143)
+        # Space rounds 128 cycles apart to avoid load conflicts (group 31 loads at 125-128)
+        # This gives (143-128)*15 = 225 cycle savings vs sequential
+        self._emit_overlapped_rounds(
+            rounds, n_groups, VL, s_idx, s_val, s_nv, s_vt1, s_vt2,
             s_idx2p1, s_vbit, s_vidxn, s_vcmp, s_ga,
             s_v1, s_v0, s_vnn, s_hc, s_hs, s_fvp)
-
-        # Round loop
-        self.emit({"alu": [("+", s_rc, s_rc, s_one)]})
-        self.emit({"alu": [("<", s_cond, s_rc, s_rounds_s)]})
-        self.emit({"flow": [("cond_jump", s_cond, loop_start)]})
 
         # === STORE results back to memory (2 vstores per cycle) ===
         self.emit({"alu": [("+", s_addr, s_ivp, s_zero),
@@ -198,17 +197,16 @@ class KernelBuilder:
         """
         Emit pipelined instructions for all groups.
         Overlaps gather of next group with hash of current group.
-        Uses 3 sets of hash temporaries alternating by group.
-        Pipeline spacing: 5 cycles between consecutive groups.
-        idx2p1 computed at cycles 16-17 (during last hash stage) to avoid
-        being overwritten by later groups sharing the same buffer set.
+        Uses 5 sets of hash temporaries alternating by group.
+        Pipeline spacing: 4 cycles between consecutive groups.
+        Hash optimized with multiply_add for stages 0,2,4 reducing from 12 to 9 cycles.
         """
-        SPACING = 5
+        SPACING = 4
 
         def group_ops(g, start_cycle):
             vi = s_idx + g * VL
             vv = s_val + g * VL
-            buf = g % 3
+            buf = g % 5
             vt1 = s_vt1[buf]
             vt2 = s_vt2[buf]
             vidx2p1 = s_idx2p1[buf]
@@ -224,24 +222,33 @@ class KernelBuilder:
                 ]))
             # Cycle 5: VALU XOR val ^= node_val
             ops.append((start_cycle + 5, "valu", [("^", vv, vv, s_nv)]))
-            # Cycles 6-17: Hash (6 stages × 2 cycles each)
+            # Cycles 6-14: Hash (6 stages, stages 0,2,4 use multiply_add = 1 cycle, others = 2 cycles)
+            # Stage 0: (a+c)+(a<<12) = a*4097+c, Stage 2: (a+c)+(a<<5) = a*33+c, Stage 4: (a+c)+(a<<3) = a*9+c
+            cycle_offset = 6
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                valu_tmp = [(op1, vt1, vv, s_hc[hi]), (op3, vt2, vv, s_hs[hi])]
-                valu_val = [(op2, vv, vt1, vt2)]
-                # Last hash stage (hi=5, cycles 16-17): also compute idx2, idx2p1
-                if hi == 5:
-                    valu_tmp.append(("+", vidx2p1, vi, vi))       # idx2 = idx + idx
-                    valu_val.append(("+", vidx2p1, vidx2p1, s_v1)) # idx2p1 = idx2 + 1
-                ops.append((start_cycle + 6 + hi * 2, "valu", valu_tmp))
-                ops.append((start_cycle + 7 + hi * 2, "valu", valu_val))
-            # Cycle 18: bit = val & 1
-            ops.append((start_cycle + 18, "valu", [("&", s_vbit, vv, s_v1)]))
-            # Cycle 19: idx_new = idx2p1 + bit
-            ops.append((start_cycle + 19, "valu", [("+", s_vidxn, vidx2p1, s_vbit)]))
-            # Cycle 20: cmp = idx_new < n_nodes
-            ops.append((start_cycle + 20, "valu", [("<", s_vcmp, s_vidxn, s_vnn)]))
-            # Cycle 21: vselect idx = cmp ? idx_new : 0
-            ops.append((start_cycle + 21, "flow", [("vselect", vi, s_vcmp, s_vidxn, s_v0)]))
+                # Use multiply_add for stages 0, 2, 4 (collapse 2 cycles to 1)
+                if hi in [0, 2, 4] and op1 == "+" and op2 == "+" and op3 == "<<":
+                    multiplier = 1 + (1 << val3)  # 1 + 2^shift
+                    # Need a broadcast constant for the multiplier
+                    s_mult = s_hs[hi]  # Reuse the shift constant slot for multiplier
+                    ops.append((start_cycle + cycle_offset, "valu", [("multiply_add", vv, vv, s_mult, s_hc[hi])]))
+                    cycle_offset += 1
+                else:
+                    valu_tmp = [(op1, vt1, vv, s_hc[hi]), (op3, vt2, vv, s_hs[hi])]
+                    valu_val = [(op2, vv, vt1, vt2)]
+                    # Last hash stage (hi=5, cycles 13-14): also compute idx2, idx2p1
+                    if hi == 5:
+                        valu_tmp.append(("+", vidx2p1, vi, vi))       # idx2 = idx + idx
+                        valu_val.append(("+", vidx2p1, vidx2p1, s_v1)) # idx2p1 = idx2 + 1
+                    ops.append((start_cycle + cycle_offset, "valu", valu_tmp))
+                    ops.append((start_cycle + cycle_offset + 1, "valu", valu_val))
+                    cycle_offset += 2
+            # After hash completes (cycle_offset is now at end of hash)
+            # Bit extraction and index update
+            ops.append((start_cycle + cycle_offset, "valu", [("&", s_vbit, vv, s_v1)]))
+            ops.append((start_cycle + cycle_offset + 1, "valu", [("+", s_vidxn, vidx2p1, s_vbit)]))
+            ops.append((start_cycle + cycle_offset + 2, "valu", [("<", s_vcmp, s_vidxn, s_vnn)]))
+            ops.append((start_cycle + cycle_offset + 3, "flow", [("vselect", vi, s_vcmp, s_vidxn, s_v0)]))
             return ops
 
         starts = [g * SPACING for g in range(n_groups)]
@@ -255,6 +262,79 @@ class KernelBuilder:
         for cycle, engine, slots in all_ops:
             schedule[cycle][engine].extend(slots)
 
+        for cycle_bundle in schedule:
+            if cycle_bundle:
+                self.emit(dict(cycle_bundle))
+
+    def _emit_overlapped_rounds(self, rounds, n_groups, VL, s_idx, s_val, s_nv,
+                                 s_vt1, s_vt2, s_idx2p1, s_vbit, s_vidxn,
+                                 s_vcmp, s_ga, s_v1, s_v0, s_vnn, s_hc, s_hs, s_fvp):
+        """
+        Emit all rounds unrolled with inter-round overlap.
+        Round spacing D=128 cycles avoids load conflicts while maximizing overlap.
+        Group 31 loads at cycles 125-128, next round's group 0 loads at 129-132.
+        Each round takes 143 cycles (32 groups * 4 spacing + 19 final cycles).
+        Total time: 143 + 15*128 = 2063 cycles instead of 16*143 = 2288 cycles.
+        """
+        SPACING = 4
+        ROUND_DELAY = 128  # cycles between round starts
+
+        def group_ops(g, start_cycle):
+            vi = s_idx + g * VL
+            vv = s_val + g * VL
+            buf = g % 5
+            vt1 = s_vt1[buf]
+            vt2 = s_vt2[buf]
+            vidx2p1 = s_idx2p1[buf]
+            ops = []
+
+            # Cycle 0: ALU addr compute (8 ALU slots)
+            ops.append((start_cycle, "alu", [("+", s_ga + i, s_fvp, vi + i) for i in range(VL)]))
+            # Cycles 1-4: Load gather (2 loads per cycle)
+            for c in range(4):
+                ops.append((start_cycle + 1 + c, "load", [
+                    ("load", s_nv + 2*c, s_ga + 2*c),
+                    ("load", s_nv + 2*c + 1, s_ga + 2*c + 1)
+                ]))
+            # Cycle 5: VALU XOR val ^= node_val
+            ops.append((start_cycle + 5, "valu", [("^", vv, vv, s_nv)]))
+            # Cycles 6-14: Hash (6 stages, stages 0,2,4 use multiply_add = 1 cycle, others = 2 cycles)
+            cycle_offset = 6
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                if hi in [0, 2, 4] and op1 == "+" and op2 == "+" and op3 == "<<":
+                    ops.append((start_cycle + cycle_offset, "valu", [("multiply_add", vv, vv, s_hs[hi], s_hc[hi])]))
+                    cycle_offset += 1
+                else:
+                    valu_tmp = [(op1, vt1, vv, s_hc[hi]), (op3, vt2, vv, s_hs[hi])]
+                    valu_val = [(op2, vv, vt1, vt2)]
+                    if hi == 5:
+                        valu_tmp.append(("+", vidx2p1, vi, vi))
+                        valu_val.append(("+", vidx2p1, vidx2p1, s_v1))
+                    ops.append((start_cycle + cycle_offset, "valu", valu_tmp))
+                    ops.append((start_cycle + cycle_offset + 1, "valu", valu_val))
+                    cycle_offset += 2
+            # Cycle 15-18: bit extraction and index update
+            ops.append((start_cycle + 15, "valu", [("&", s_vbit, vv, s_v1)]))
+            ops.append((start_cycle + 16, "valu", [("+", s_vidxn, vidx2p1, s_vbit)]))
+            ops.append((start_cycle + 17, "valu", [("<", s_vcmp, s_vidxn, s_vnn)]))
+            ops.append((start_cycle + 18, "flow", [("vselect", vi, s_vcmp, s_vidxn, s_v0)]))
+            return ops
+
+        # Generate all operations for all rounds with overlap
+        all_ops = []
+        for r in range(rounds):
+            round_start = r * ROUND_DELAY
+            for g in range(n_groups):
+                group_start = round_start + g * SPACING
+                all_ops.extend(group_ops(g, group_start))
+
+        # Schedule all operations
+        max_cycle = max(cycle for cycle, _, _ in all_ops) + 1
+        schedule = [defaultdict(list) for _ in range(max_cycle)]
+        for cycle, engine, slots in all_ops:
+            schedule[cycle][engine].extend(slots)
+
+        # Emit the schedule
         for cycle_bundle in schedule:
             if cycle_bundle:
                 self.emit(dict(cycle_bundle))
