@@ -1,8 +1,8 @@
 # Kernel Optimization Summary
 
 ## Current Performance
-- **Cycles**: 2127 (down from 2129)
-- **Speedup**: 69.5x over baseline (147,734 cycles)
+- **Cycles**: 2122 (down from 2127; was 2129 at start)
+- **Speedup**: ~69.6x over baseline (147,734 cycles)
 - **Tests Passed**: 4/9 (all correctness + 3/8 speed tests)
 
 ## Optimizations Applied
@@ -52,9 +52,14 @@ Computed both addresses in parallel using available ALU slots.
 - Eliminated `s_rc`, `s_rounds_s`, `s_cond` (unused scratch registers)
 - Cleaner code with no performance impact
 
+### 5. Round 0 broadcast + earlier round 1 (5 cycles saved)
+- **Round 0**: All batch elements start at index 0. Load `tree[0]` once, broadcast to `s_node0_v`. Skip gather and address compute for round 0; use XOR with broadcast, then hash + index update. Separate `s_vbit0` / `s_vidxn0` / `s_vcmp0` avoid clobber when round 1 overlaps.
+- **Round 1 start**: Round 0 has no loads in the last group, so round 1 can start at cycle 123 instead of 128, saving 5 cycles total.
+- **Init**: Fold `tree[0]` load into last hash-const broadcast cycle; fold `node0_v` vbroadcast into the ALU addr-setup cycle before the vload loop. No extra init cycles for round-0 broadcast.
+
 ## Performance Breakdown
 
-### Total: 2127 cycles
+### Total: 2122 cycles
 1. **Initialization**: ~46 cycles
    - Load constants and header: 5 cycles
    - Broadcast vector constants: 8 cycles

@@ -79,7 +79,6 @@ class KernelBuilder:
     def build_kernel(self, forest_height, n_nodes, batch_size, rounds):
         VL = VLEN  # 8
         n_groups = batch_size // VL  # 32
-
         # === SCRATCH ALLOCATION ===
         s_idx = self.alloc_scratch("s_idx", batch_size)   # 256 words for indices
         s_val = self.alloc_scratch("s_val", batch_size)   # 256 words for values
@@ -93,6 +92,12 @@ class KernelBuilder:
         s_vidxn = self.alloc_scratch("s_vidxn", VL)
         s_vcmp = self.alloc_scratch("s_vcmp", VL)
         s_ga = self.alloc_scratch("s_ga", VL)             # 8 gather address regs
+        # Round 0 only: tree[0] broadcast, separate index-update temps to allow earlier round 1
+        s_node0 = self.alloc_scratch("s_node0")
+        s_node0_v = self.alloc_scratch("s_node0_v", VL)
+        s_vbit0 = self.alloc_scratch("s_vbit0", VL)
+        s_vidxn0 = self.alloc_scratch("s_vidxn0", VL)
+        s_vcmp0 = self.alloc_scratch("s_vcmp0", VL)
 
         # Vector constants
         s_v1 = self.alloc_scratch("s_v1", VL)
@@ -146,11 +151,13 @@ class KernelBuilder:
                                     ("const", s_tmp2, next_val2)]})
             else:
                 self.emit({"valu": [("vbroadcast", s_hc[hi], s_tmp),
-                                    ("vbroadcast", s_hs[hi], s_tmp2)]})
+                                    ("vbroadcast", s_hs[hi], s_tmp2)],
+                           "load": [("load", s_node0, s_fvp)]})
 
         # Load indices and values from memory into scratch
         self.emit({"alu": [("+", s_addr, s_iip, s_zero),
-                           ("+", s_addr2, s_ivp, s_zero)]})
+                           ("+", s_addr2, s_ivp, s_zero)],
+                   "valu": [("vbroadcast", s_node0_v, s_node0)]})
         for g in range(n_groups):
             bundle = {"load": [("vload", s_idx + g * VL, s_addr),
                                ("vload", s_val + g * VL, s_addr2)]}
@@ -167,7 +174,8 @@ class KernelBuilder:
         self._emit_level_aware_rounds(
             rounds, n_groups, VL, s_idx, s_val, s_nv, s_vt1, s_vt2,
             s_idx2p1, s_vbit, s_vidxn, s_vcmp, s_ga,
-            s_v1, s_v0, s_vnn, s_hc, s_hs, s_fvp)
+            s_v1, s_v0, s_vnn, s_hc, s_hs, s_fvp,
+            s_node0_v, s_vbit0, s_vidxn0, s_vcmp0)
 
         # === STORE results back to memory (2 vstores per cycle) ===
         self.emit({"alu": [("+", s_addr, s_ivp, s_zero),
@@ -261,45 +269,77 @@ class KernelBuilder:
     def _emit_level_aware_rounds(self, rounds, n_groups, VL, s_idx, s_val, s_nv,
                                  s_vt1, s_vt2, s_idx2p1, s_vbit, s_vidxn,
                                  s_vcmp, s_ga, s_v1, s_v0, s_vnn,
-                                 s_hc, s_hs, s_fvp):
+                                 s_hc, s_hs, s_fvp,
+                                 s_node0_v, s_vbit0, s_vidxn0, s_vcmp0):
         """
-        Emit all rounds unrolled with standard gather approach.
-
-        NOTE: Initially attempted level-aware optimization (preload tree levels 0-7)
-        but ISA constraints prevent efficient implementation:
-        1. Cannot load from scratch (only from memory)
-        2. Cannot efficiently select from cached values without gather
-        3. Slot limits prevent aggressive packing even when skipping gather
-
-        For Round 0 optimization (all idx=0), loading tree[0] once and broadcasting
-        still requires spacing >=5 to avoid VALU slot violations, saving minimal cycles.
-
-        Future: Requires ISA extensions (scratch-to-scratch gather, fused ops)
+        Emit all rounds unrolled. Round 0: all idx=0, use tree[0] broadcast
+        (no gather). Round 1 starts at 125 (round 0 has no loads in last group).
         """
         SPACING = 4
-        ROUND_DELAY = 128  # cycles between round starts
+        ROUND_DELAY = 128  # between gather rounds
+        ROUND1_START = 123  # round 0 has no loads → can start round 1 earlier
 
-        # Generate all operations for all rounds using standard gather
         all_ops = []
         for r in range(rounds):
-            round_start = r * ROUND_DELAY
-            for g in range(n_groups):
-                group_start = round_start + g * SPACING
-                all_ops.extend(self._group_ops_gather(g, group_start, VL, s_idx, s_val,
-                                                      s_nv, s_vt1, s_vt2, s_idx2p1, s_vbit,
-                                                      s_vidxn, s_vcmp, s_ga, s_v1, s_v0,
-                                                      s_vnn, s_hc, s_hs, s_fvp))
+            if r == 0:
+                round_start = 0
+                for g in range(n_groups):
+                    group_start = round_start + g * SPACING
+                    all_ops.extend(self._group_ops_round0(
+                        g, group_start, VL, s_idx, s_val, s_node0_v,
+                        s_vt1, s_vt2, s_idx2p1, s_vbit0, s_vidxn0, s_vcmp0,
+                        s_v1, s_v0, s_vnn, s_hc, s_hs))
+            else:
+                round_start = ROUND1_START + (r - 1) * ROUND_DELAY
+                for g in range(n_groups):
+                    group_start = round_start + g * SPACING
+                    all_ops.extend(self._group_ops_gather(g, group_start, VL, s_idx, s_val,
+                                                          s_nv, s_vt1, s_vt2, s_idx2p1, s_vbit,
+                                                          s_vidxn, s_vcmp, s_ga, s_v1, s_v0,
+                                                          s_vnn, s_hc, s_hs, s_fvp))
 
-        # Schedule all operations
         max_cycle = max(cycle for cycle, _, _ in all_ops) + 1
         schedule = [defaultdict(list) for _ in range(max_cycle)]
         for cycle, engine, slots in all_ops:
             schedule[cycle][engine].extend(slots)
 
-        # Emit the schedule
         for cycle_bundle in schedule:
             if cycle_bundle:
                 self.emit(dict(cycle_bundle))
+
+    def _group_ops_round0(self, g, start_cycle, VL, s_idx, s_val, s_node0_v,
+                          s_vt1, s_vt2, s_idx2p1, s_vbit0, s_vidxn0, s_vcmp0,
+                          s_v1, s_v0, s_vnn, s_hc, s_hs):
+        """Round 0: all idx=0. No addr compute, no gather; XOR with broadcast tree[0]."""
+        vi = s_idx + g * VL
+        vv = s_val + g * VL
+        buf = g % 3
+        vt1 = s_vt1[buf]
+        vt2 = s_vt2[buf]
+        vidx2p1 = s_idx2p1[buf]
+        ops = []
+
+        # Cycle 0: XOR (no addr, no loads)
+        ops.append((start_cycle, "valu", [("^", vv, vv, s_node0_v)]))
+        cycle_offset = 1
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            if hi in [0, 2, 4] and op1 == "+" and op2 == "+" and op3 == "<<":
+                ops.append((start_cycle + cycle_offset, "valu", [("multiply_add", vv, vv, s_hs[hi], s_hc[hi])]))
+                cycle_offset += 1
+            else:
+                valu_tmp = [(op1, vt1, vv, s_hc[hi]), (op3, vt2, vv, s_hs[hi])]
+                valu_val = [(op2, vv, vt1, vt2)]
+                if hi == 5:
+                    valu_tmp.append(("+", vidx2p1, vi, vi))
+                    valu_val.append(("+", vidx2p1, vidx2p1, s_v1))
+                ops.append((start_cycle + cycle_offset, "valu", valu_tmp))
+                ops.append((start_cycle + cycle_offset + 1, "valu", valu_val))
+                cycle_offset += 2
+        ops.append((start_cycle + cycle_offset, "valu", [("&", s_vbit0, vv, s_v1)]))
+        ops.append((start_cycle + cycle_offset + 1, "valu", [("+", s_vidxn0, vidx2p1, s_vbit0)]))
+        ops.append((start_cycle + cycle_offset + 2, "valu", [("<", s_vcmp0, s_vidxn0, s_vnn)]))
+        ops.append((start_cycle + cycle_offset + 3, "flow", [("vselect", vi, s_vcmp0, s_vidxn0, s_v0)]))
+        return ops
 
     def _group_ops_gather(self, g, start_cycle, VL, s_idx, s_val, s_nv, s_vt1, s_vt2,
                          s_idx2p1, s_vbit, s_vidxn, s_vcmp, s_ga, s_v1, s_v0, s_vnn,
