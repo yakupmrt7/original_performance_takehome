@@ -98,7 +98,6 @@ class KernelBuilder:
         s_vbit0 = self.alloc_scratch("s_vbit0", VL)
         s_vidxn0 = self.alloc_scratch("s_vidxn0", VL)
         s_vcmp0 = self.alloc_scratch("s_vcmp0", VL)
-
         # Vector constants
         s_v1 = self.alloc_scratch("s_v1", VL)
         s_v0 = self.alloc_scratch("s_v0", VL)
@@ -164,32 +163,63 @@ class KernelBuilder:
             if g < n_groups - 1:
                 bundle["alu"] = [("+", s_addr, s_addr, s_vlen_s),
                                  ("+", s_addr2, s_addr2, s_vlen_s)]
+            else:
+                # Last vload: prepare store addr for interleaved store (ivp, ivp+VL, 2*VL)
+                bundle["alu"] = [("+", s_addr, s_ivp, s_zero),
+                                 ("+", s_addr2, s_ivp, s_vlen_s),
+                                 ("+", s_tmp, s_vlen_s, s_vlen_s)]
             self.emit(bundle)
 
-        # Pause for reference kernel yield sync (only for local tests, disabled in submission)
-        self.emit({"flow": [("pause",)]})
-
         # === UNROLLED ROUNDS with overlap (submission tests have pause disabled) ===
-        # Standard gather-based approach (level-aware optimization not viable with current ISA)
-        self._emit_level_aware_rounds(
+        schedule, max_cycle = self._emit_level_aware_rounds(
             rounds, n_groups, VL, s_idx, s_val, s_nv, s_vt1, s_vt2,
             s_idx2p1, s_vbit, s_vidxn, s_vcmp, s_ga,
             s_v1, s_v0, s_vnn, s_hc, s_hs, s_fvp,
             s_node0_v, s_vbit0, s_vidxn0, s_vcmp0)
 
-        # === STORE results back to memory (2 vstores per cycle) ===
-        self.emit({"alu": [("+", s_addr, s_ivp, s_zero),
-                           ("+", s_addr2, s_ivp, s_vlen_s),
-                           ("+", s_tmp, s_vlen_s, s_vlen_s)]})  # s_addr2 = ivp+VL, s_tmp = 2*VL
-        for g in range(0, n_groups, 2):
-            bundle = {"store": [("vstore", s_addr, s_val + g * VL),
-                                ("vstore", s_addr2, s_val + (g + 1) * VL)]}
-            if g + 2 < n_groups:
-                bundle["alu"] = [("+", s_addr, s_addr, s_tmp),
-                                 ("+", s_addr2, s_addr2, s_tmp)]
-            self.emit(bundle)
+        # === Interleave store with main loop: store each pair when both groups done ===
+        ROUND_DELAY = 128
+        ROUND1_START = 123
+        last_start = 0 if rounds <= 1 else ROUND1_START + (rounds - 2) * ROUND_DELAY
+        lat = 14 if rounds <= 1 else 19
+        def finish(g):
+            return last_start + g * 4 + (lat - 1)
 
-        self.emit({"flow": [("pause",)]})
+        store_cycles = []
+        for g in range(0, n_groups, 2):
+            store_cycles.append(1 + max(finish(g), finish(g + 1)))
+
+        # Ensure schedule extends to last store cycle
+        while len(schedule) <= store_cycles[-1]:
+            schedule.append(defaultdict(list))
+
+        # Store addr already set in last vload cycle; just add vstores + addr updates
+        for i, g in enumerate(range(0, n_groups, 2)):
+            c = store_cycles[i]
+            schedule[c]["store"].extend([
+                ("vstore", s_addr, s_val + g * VL),
+                ("vstore", s_addr2, s_val + (g + 1) * VL),
+            ])
+            if g + 2 < n_groups:
+                nalu = len(schedule[c]["alu"]) + 2
+                if nalu <= SLOT_LIMITS["alu"]:
+                    schedule[c]["alu"].extend([
+                        ("+", s_addr, s_addr, s_tmp),
+                        ("+", s_addr2, s_addr2, s_tmp),
+                    ])
+                else:
+                    while len(schedule) <= c + 1:
+                        schedule.append(defaultdict(list))
+                    schedule[c + 1]["alu"].extend([
+                        ("+", s_addr, s_addr, s_tmp),
+                        ("+", s_addr2, s_addr2, s_tmp),
+                    ])
+
+        end = max(max_cycle, store_cycles[-1] + 1)
+        for c in range(end):
+            bundle = dict(schedule[c]) if c < len(schedule) else {}
+            if bundle:
+                self.emit(bundle)
 
     def _emit_pipelined_groups(self, n_groups, VL, s_idx, s_val, s_nv,
                                 s_vt1, s_vt2, s_idx2p1, s_vbit, s_vidxn,
@@ -271,29 +301,23 @@ class KernelBuilder:
                                  s_vcmp, s_ga, s_v1, s_v0, s_vnn,
                                  s_hc, s_hs, s_fvp,
                                  s_node0_v, s_vbit0, s_vidxn0, s_vcmp0):
-        """
-        Emit all rounds unrolled. Round 0: all idx=0, use tree[0] broadcast
-        (no gather). Round 1 starts at 125 (round 0 has no loads in last group).
-        """
+        """Round 0: tree[0] broadcast (no gather). Round 1+ at ROUND1_START + (r-1)*128."""
         SPACING = 4
-        ROUND_DELAY = 128  # between gather rounds
-        ROUND1_START = 123  # round 0 has no loads → can start round 1 earlier
+        ROUND_DELAY = 128
+        ROUND1_START = 123
 
         all_ops = []
         for r in range(rounds):
-            if r == 0:
-                round_start = 0
-                for g in range(n_groups):
-                    group_start = round_start + g * SPACING
+            start = 0 if r == 0 else ROUND1_START + (r - 1) * ROUND_DELAY
+            for g in range(n_groups):
+                gs = start + g * SPACING
+                if r == 0:
                     all_ops.extend(self._group_ops_round0(
-                        g, group_start, VL, s_idx, s_val, s_node0_v,
+                        g, gs, VL, s_idx, s_val, s_node0_v,
                         s_vt1, s_vt2, s_idx2p1, s_vbit0, s_vidxn0, s_vcmp0,
                         s_v1, s_v0, s_vnn, s_hc, s_hs))
-            else:
-                round_start = ROUND1_START + (r - 1) * ROUND_DELAY
-                for g in range(n_groups):
-                    group_start = round_start + g * SPACING
-                    all_ops.extend(self._group_ops_gather(g, group_start, VL, s_idx, s_val,
+                else:
+                    all_ops.extend(self._group_ops_gather(g, gs, VL, s_idx, s_val,
                                                           s_nv, s_vt1, s_vt2, s_idx2p1, s_vbit,
                                                           s_vidxn, s_vcmp, s_ga, s_v1, s_v0,
                                                           s_vnn, s_hc, s_hs, s_fvp))
@@ -302,10 +326,7 @@ class KernelBuilder:
         schedule = [defaultdict(list) for _ in range(max_cycle)]
         for cycle, engine, slots in all_ops:
             schedule[cycle][engine].extend(slots)
-
-        for cycle_bundle in schedule:
-            if cycle_bundle:
-                self.emit(dict(cycle_bundle))
+        return schedule, max_cycle
 
     def _group_ops_round0(self, g, start_cycle, VL, s_idx, s_val, s_node0_v,
                           s_vt1, s_vt2, s_idx2p1, s_vbit0, s_vidxn0, s_vcmp0,
@@ -339,6 +360,42 @@ class KernelBuilder:
         ops.append((start_cycle + cycle_offset + 1, "valu", [("+", s_vidxn0, vidx2p1, s_vbit0)]))
         ops.append((start_cycle + cycle_offset + 2, "valu", [("<", s_vcmp0, s_vidxn0, s_vnn)]))
         ops.append((start_cycle + cycle_offset + 3, "flow", [("vselect", vi, s_vcmp0, s_vidxn0, s_v0)]))
+        return ops
+
+    def _group_ops_level1(self, g, start_cycle, VL, s_idx, s_val, s_nv, s_tlev,
+                          s_vt1, s_vt2, s_idx2p1, s_vbit, s_vidxn, s_vcmp,
+                          s_v1, s_v0, s_vnn, s_hc, s_hs):
+        """Level 1: idx in {1,2}. Select tree[1] or tree[2] via idx&1; no gather."""
+        vi = s_idx + g * VL
+        vv = s_val + g * VL
+        buf = g % 3
+        vt1 = s_vt1[buf]
+        vt2 = s_vt2[buf]
+        vidx2p1 = s_idx2p1[buf]
+        t1_v, t2_v = s_tlev[0], s_tlev[1]
+        ops = []
+
+        ops.append((start_cycle, "valu", [("&", vt1, vi, s_v1)]))
+        ops.append((start_cycle + 1, "flow", [("vselect", s_nv, vt1, t1_v, t2_v)]))
+        ops.append((start_cycle + 2, "valu", [("^", vv, vv, s_nv)]))
+        cycle_offset = 3
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            if hi in [0, 2, 4] and op1 == "+" and op2 == "+" and op3 == "<<":
+                ops.append((start_cycle + cycle_offset, "valu", [("multiply_add", vv, vv, s_hs[hi], s_hc[hi])]))
+                cycle_offset += 1
+            else:
+                valu_tmp = [(op1, vt1, vv, s_hc[hi]), (op3, vt2, vv, s_hs[hi])]
+                valu_val = [(op2, vv, vt1, vt2)]
+                if hi == 5:
+                    valu_tmp.append(("+", vidx2p1, vi, vi))
+                    valu_val.append(("+", vidx2p1, vidx2p1, s_v1))
+                ops.append((start_cycle + cycle_offset, "valu", valu_tmp))
+                ops.append((start_cycle + cycle_offset + 1, "valu", valu_val))
+                cycle_offset += 2
+        ops.append((start_cycle + cycle_offset, "valu", [("&", s_vbit, vv, s_v1)]))
+        ops.append((start_cycle + cycle_offset + 1, "valu", [("+", s_vidxn, vidx2p1, s_vbit)]))
+        ops.append((start_cycle + cycle_offset + 2, "valu", [("<", s_vcmp, s_vidxn, s_vnn)]))
+        ops.append((start_cycle + cycle_offset + 3, "flow", [("vselect", vi, s_vcmp, s_vidxn, s_v0)]))
         return ops
 
     def _group_ops_gather(self, g, start_cycle, VL, s_idx, s_val, s_nv, s_vt1, s_vt2,
