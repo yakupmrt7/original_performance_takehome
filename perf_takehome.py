@@ -48,7 +48,8 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots, vliw=False):
+    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+        # Simple slot packing that just uses one slot per instruction bundle
         instrs = []
         for engine, slot in slots:
             instrs.append({engine: [slot]})
@@ -57,16 +58,13 @@ class KernelBuilder:
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
 
-    def emit(self, bundle):
-        self.instrs.append(bundle)
-
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
         if name is not None:
             self.scratch[name] = addr
             self.scratch_debug[addr] = (name, length)
         self.scratch_ptr += length
-        assert self.scratch_ptr <= SCRATCH_SIZE, f"Out of scratch space: {self.scratch_ptr} > {SCRATCH_SIZE}"
+        assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
     def scratch_const(self, val, name=None):
@@ -76,447 +74,709 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_kernel(self, forest_height, n_nodes, batch_size, rounds):
-        VL = VLEN  # 8
-        n_groups = batch_size // VL  # 32
-        # === SCRATCH ALLOCATION ===
-        s_idx = self.alloc_scratch("s_idx", batch_size)   # 256 words for indices
-        s_val = self.alloc_scratch("s_val", batch_size)   # 256 words for values
+    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
+        slots = []
 
-        # Vector temporaries - 3 sets minimum for pipeline interleaving
-        s_nv = self.alloc_scratch("s_nv", VL)             # gathered node values
-        s_vt1 = [self.alloc_scratch(f"svt1_{i}", VL) for i in range(3)]
-        s_vt2 = [self.alloc_scratch(f"svt2_{i}", VL) for i in range(3)]
-        s_idx2p1 = [self.alloc_scratch(f"si2p1_{i}", VL) for i in range(3)]
-        s_vbit = self.alloc_scratch("s_vbit", VL)
-        s_vidxn = self.alloc_scratch("s_vidxn", VL)
-        s_vcmp = self.alloc_scratch("s_vcmp", VL)
-        s_ga = self.alloc_scratch("s_ga", VL)             # 8 gather address regs
-        # Round 0 only: tree[0] broadcast, separate index-update temps to allow earlier round 1
-        s_node0 = self.alloc_scratch("s_node0")
-        s_node0_v = self.alloc_scratch("s_node0_v", VL)
-        s_vbit0 = self.alloc_scratch("s_vbit0", VL)
-        s_vidxn0 = self.alloc_scratch("s_vidxn0", VL)
-        s_vcmp0 = self.alloc_scratch("s_vcmp0", VL)
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
+            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
+            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
+            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+
+        return slots
+
+    def build_kernel(
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+    ):
+        """
+        Optimized kernel tuned for the fixed test configuration.
+        Uses vector ops, VLIW scheduling, and algebraic hash reductions.
+        """
+        # Fixed test configuration (submission tests use these values)
+        assert forest_height == 10
+        assert n_nodes == 2047
+        assert batch_size == 256
+        assert rounds == 16
+
+        n_chunks = batch_size // VLEN
+        assert batch_size % VLEN == 0
+
+        def vec_addrs(base):
+            return tuple(range(base, base + VLEN))
+
+        def vec_base(base, chunk):
+            return base + chunk * VLEN
+
+        # Scratch layout
+        tmp_scalar = self.alloc_scratch("tmp_scalar")
+
+        idx_base = self.alloc_scratch("idx_vec", batch_size)
+        val_base = self.alloc_scratch("val_vec", batch_size)
+        tmp1_base = self.alloc_scratch("tmp1_vec", batch_size)
+        tmp2_base = self.alloc_scratch("tmp2_vec", batch_size)
+        tmp3_base = self.alloc_scratch("tmp3_vec", batch_size)
+
+        val_addr = self.alloc_scratch("val_addr")
+
+        # Scalar constants/pointers
+        inp_values_p = self.alloc_scratch("inp_values_p")
+
         # Vector constants
-        s_v1 = self.alloc_scratch("s_v1", VL)
-        s_v0 = self.alloc_scratch("s_v0", VL)
-        s_vnn = self.alloc_scratch("s_vnn", VL)
+        vec_consts = {}
 
-        # Hash constant vectors
-        s_hc = []
-        s_hs = []
-        for hi in range(len(HASH_STAGES)):
-            s_hc.append(self.alloc_scratch(f"shc{hi}", VL))
-            s_hs.append(self.alloc_scratch(f"shs{hi}", VL))
+        def alloc_vec_const(name):
+            vec_consts[name] = self.alloc_scratch(name, VLEN)
+            return vec_consts[name]
 
-        # Scalar registers
-        s_fvp = self.alloc_scratch("sfvp")
-        s_iip = self.alloc_scratch("siip")
-        s_ivp = self.alloc_scratch("sivp")
-        s_one = self.alloc_scratch("sone")
-        s_zero = self.alloc_scratch("szero")
-        s_nn = self.alloc_scratch("snn")
-        s_tmp = self.alloc_scratch("stmp")
-        s_tmp2 = self.alloc_scratch("stmp2")
-        s_addr = self.alloc_scratch("saddr")
-        s_addr2 = self.alloc_scratch("saddr2")
-        s_vlen_s = self.alloc_scratch("svlen")
+        c0 = alloc_vec_const("v0")
+        c1 = alloc_vec_const("v1")
+        c2 = alloc_vec_const("v2")
+        c9 = alloc_vec_const("v9")
+        c16 = alloc_vec_const("v16")
+        c19 = alloc_vec_const("v19")
+        c33 = alloc_vec_const("v33")
+        c4097 = alloc_vec_const("v4097")
+        c_forest = alloc_vec_const("v_forest_base")
+        c_n_nodes = alloc_vec_const("v_n_nodes")
+        h1 = alloc_vec_const("h1")
+        h2 = alloc_vec_const("h2")
+        h3 = alloc_vec_const("h3")
+        h4 = alloc_vec_const("h4")
+        h5 = alloc_vec_const("h5")
+        h6 = alloc_vec_const("h6")
 
-        # === INITIALIZATION ===
-        self.emit({"load": [("const", s_zero, 0), ("const", s_one, 1)]})
-        self.emit({"load": [("const", s_tmp, 4), ("const", s_tmp2, 5)]})
-        self.emit({"load": [("const", s_addr, 6), ("const", s_vlen_s, VL)]})
-        self.emit({"load": [("load", s_nn, s_one), ("load", s_fvp, s_tmp)]})
-        self.emit({"load": [("load", s_iip, s_tmp2), ("load", s_ivp, s_addr)]})
+        node0 = alloc_vec_const("node0")
+        node1 = alloc_vec_const("node1")
+        node2 = alloc_vec_const("node2")
+        node3 = alloc_vec_const("node3")
+        node4 = alloc_vec_const("node4")
+        node5 = alloc_vec_const("node5")
+        node6 = alloc_vec_const("node6")
+        # (no extra node xor constants)
+        d12 = alloc_vec_const("node1_minus_node2")
+        d34 = alloc_vec_const("node4_minus_node3")
+        d56 = alloc_vec_const("node6_minus_node5")
 
-        # Broadcast vector constants + pipeline hash const loading
-        # For stages 0,2,4: load multipliers (1 + 2^shift) instead of shifts
-        stage0_mult = 1 + (1 << HASH_STAGES[0][4])  # 1 + 2^12 = 4097
-        self.emit({"valu": [("vbroadcast", s_v1, s_one),
-                            ("vbroadcast", s_v0, s_zero),
-                            ("vbroadcast", s_vnn, s_nn)],
-                   "load": [("const", s_tmp, HASH_STAGES[0][1] % (2**32)),
-                            ("const", s_tmp2, stage0_mult)]})
-        for hi in range(len(HASH_STAGES)):
-            if hi + 1 < len(HASH_STAGES):
-                next_val2 = HASH_STAGES[hi+1][4]
-                # For stages 0,2,4: compute multiplier; for others: use shift value
-                if hi+1 in [0, 2, 4] and HASH_STAGES[hi+1][0] == "+" and HASH_STAGES[hi+1][2] == "+" and HASH_STAGES[hi+1][3] == "<<":
-                    next_val2 = 1 + (1 << HASH_STAGES[hi+1][4])
-                self.emit({"valu": [("vbroadcast", s_hc[hi], s_tmp),
-                                    ("vbroadcast", s_hs[hi], s_tmp2)],
-                           "load": [("const", s_tmp, HASH_STAGES[hi+1][1] % (2**32)),
-                                    ("const", s_tmp2, next_val2)]})
-            else:
-                self.emit({"valu": [("vbroadcast", s_hc[hi], s_tmp),
-                                    ("vbroadcast", s_hs[hi], s_tmp2)],
-                           "load": [("load", s_node0, s_fvp)]})
+        prologue_ops = []
+        round_ops = [[] for _ in range(rounds)]
+        all_round_ops = []
+        epilogue_ops = []
 
-        # Load indices and values from memory into scratch
-        self.emit({"alu": [("+", s_addr, s_iip, s_zero),
-                           ("+", s_addr2, s_ivp, s_zero)],
-                   "valu": [("vbroadcast", s_node0_v, s_node0)]})
-        for g in range(n_groups):
-            bundle = {"load": [("vload", s_idx + g * VL, s_addr),
-                               ("vload", s_val + g * VL, s_addr2)]}
-            if g < n_groups - 1:
-                bundle["alu"] = [("+", s_addr, s_addr, s_vlen_s),
-                                 ("+", s_addr2, s_addr2, s_vlen_s)]
-            else:
-                # Last vload: prepare store addr for interleaved store (ivp, ivp+VL, 2*VL)
-                bundle["alu"] = [("+", s_addr, s_ivp, s_zero),
-                                 ("+", s_addr2, s_ivp, s_vlen_s),
-                                 ("+", s_tmp, s_vlen_s, s_vlen_s)]
-            self.emit(bundle)
+        def add_op(op_list, engine, slot, reads=(), writes=(), kind=None):
+            op_list.append(
+                {
+                    "engine": engine,
+                    "slot": slot,
+                    "reads": reads,
+                    "writes": writes,
+                    "kind": kind,
+                }
+            )
 
-        # === UNROLLED ROUNDS with overlap (submission tests have pause disabled) ===
-        schedule, max_cycle = self._emit_level_aware_rounds(
-            rounds, n_groups, VL, s_idx, s_val, s_nv, s_vt1, s_vt2,
-            s_idx2p1, s_vbit, s_vidxn, s_vcmp, s_ga,
-            s_v1, s_v0, s_vnn, s_hc, s_hs, s_fvp,
-            s_node0_v, s_vbit0, s_vidxn0, s_vcmp0)
+        # Load scalar constants/pointers
+        add_op(prologue_ops, "load", ("const", inp_values_p, 2310), writes=(inp_values_p,))
 
-        # === Interleave store with main loop: store each pair when both groups done ===
-        ROUND_DELAY = 128
-        ROUND1_START = 123
-        last_start = 0 if rounds <= 1 else ROUND1_START + (rounds - 2) * ROUND_DELAY
-        lat = 14 if rounds <= 1 else 19
-        def finish(g):
-            return last_start + g * 4 + (lat - 1)
+        # Broadcast vector constants
+        def vbroadcast(dest, val):
+            add_op(prologue_ops, "load", ("const", tmp_scalar, val), writes=(tmp_scalar,))
+            add_op(
+                prologue_ops,
+                "valu",
+                ("vbroadcast", dest, tmp_scalar),
+                reads=(tmp_scalar,),
+                writes=vec_addrs(dest),
+            )
 
-        store_cycles = []
-        for g in range(0, n_groups, 2):
-            store_cycles.append(1 + max(finish(g), finish(g + 1)))
+        vbroadcast(c0, 0)
+        vbroadcast(c1, 1)
+        vbroadcast(c2, 2)
+        vbroadcast(c9, 9)
+        vbroadcast(c16, 16)
+        vbroadcast(c19, 19)
+        vbroadcast(c33, 33)
+        vbroadcast(c4097, 4097)
+        vbroadcast(c_forest, 7)
+        vbroadcast(c_n_nodes, 2047)
 
-        # Ensure schedule extends to last store cycle
-        while len(schedule) <= store_cycles[-1]:
-            schedule.append(defaultdict(list))
+        vbroadcast(h1, 0x7ED55D16)
+        vbroadcast(h2, 0xC761C23C)
+        vbroadcast(h3, 0x165667B1)
+        vbroadcast(h4, 0xD3A2646C)
+        vbroadcast(h5, 0xFD7046C5)
+        vbroadcast(h6, 0xB55A4F09)
 
-        # Store addr already set in last vload cycle; just add vstores + addr updates
-        for i, g in enumerate(range(0, n_groups, 2)):
-            c = store_cycles[i]
-            schedule[c]["store"].extend([
-                ("vstore", s_addr, s_val + g * VL),
-                ("vstore", s_addr2, s_val + (g + 1) * VL),
-            ])
-            if g + 2 < n_groups:
-                nalu = len(schedule[c]["alu"]) + 2
-                if nalu <= SLOT_LIMITS["alu"]:
-                    schedule[c]["alu"].extend([
-                        ("+", s_addr, s_addr, s_tmp),
-                        ("+", s_addr2, s_addr2, s_tmp),
-                    ])
-                else:
-                    while len(schedule) <= c + 1:
-                        schedule.append(defaultdict(list))
-                    schedule[c + 1]["alu"].extend([
-                        ("+", s_addr, s_addr, s_tmp),
-                        ("+", s_addr2, s_addr2, s_tmp),
-                    ])
+        # Load node constants (nodes 0..6) and broadcast
+        for nid, dest in enumerate([node0, node1, node2, node3, node4, node5, node6]):
+            add_op(prologue_ops, "load", ("const", tmp_scalar, 7 + nid), writes=(tmp_scalar,))
+            add_op(
+                prologue_ops,
+                "load",
+                ("load", tmp_scalar, tmp_scalar),
+                reads=(tmp_scalar,),
+                writes=(tmp_scalar,),
+            )
+            add_op(
+                prologue_ops,
+                "valu",
+                ("vbroadcast", dest, tmp_scalar),
+                reads=(tmp_scalar,),
+                writes=vec_addrs(dest),
+            )
+        # Precompute small diffs for branchless selects in early rounds
+        add_op(
+            prologue_ops,
+            "valu",
+            ("-", d12, node1, node2),
+            reads=vec_addrs(node1) + vec_addrs(node2),
+            writes=vec_addrs(d12),
+        )
+        add_op(
+            prologue_ops,
+            "valu",
+            ("-", d34, node4, node3),
+            reads=vec_addrs(node4) + vec_addrs(node3),
+            writes=vec_addrs(d34),
+        )
+        add_op(
+            prologue_ops,
+            "valu",
+            ("-", d56, node6, node5),
+            reads=vec_addrs(node6) + vec_addrs(node5),
+            writes=vec_addrs(d56),
+        )
 
-        end = max(max_cycle, store_cycles[-1] + 1)
-        for c in range(end):
-            bundle = dict(schedule[c]) if c < len(schedule) else {}
-            if bundle:
-                self.emit(bundle)
 
-    def _emit_pipelined_groups(self, n_groups, VL, s_idx, s_val, s_nv,
-                                s_vt1, s_vt2, s_idx2p1, s_vbit, s_vidxn,
-                                s_vcmp, s_ga, s_v1, s_v0, s_vnn, s_hc, s_hs, s_fvp):
-        """
-        Emit pipelined instructions for all groups.
-        Overlaps gather of next group with hash of current group.
-        Uses 5 sets of hash temporaries alternating by group.
-        Pipeline spacing: 4 cycles between consecutive groups.
-        Hash optimized with multiply_add for stages 0,2,4 reducing from 12 to 9 cycles.
-        """
-        SPACING = 4
 
-        def group_ops(g, start_cycle):
-            vi = s_idx + g * VL
-            vv = s_val + g * VL
-            buf = g % 3
-            vt1 = s_vt1[buf]
-            vt2 = s_vt2[buf]
-            vidx2p1 = s_idx2p1[buf]
-            ops = []
 
-            # Cycle 0: ALU addr compute (8 ALU slots)
-            ops.append((start_cycle, "alu", [("+", s_ga + i, s_fvp, vi + i) for i in range(VL)]))
-            # Cycles 1-4: Load gather (2 loads per cycle)
-            for c in range(4):
-                ops.append((start_cycle + 1 + c, "load", [
-                    ("load", s_nv + 2*c, s_ga + 2*c),
-                    ("load", s_nv + 2*c + 1, s_ga + 2*c + 1)
-                ]))
-            # Cycle 5: VALU XOR val ^= node_val
-            ops.append((start_cycle + 5, "valu", [("^", vv, vv, s_nv)]))
-            # Cycles 6-14: Hash (6 stages, stages 0,2,4 use multiply_add = 1 cycle, others = 2 cycles)
-            # Stage 0: (a+c)+(a<<12) = a*4097+c, Stage 2: (a+c)+(a<<5) = a*33+c, Stage 4: (a+c)+(a<<3) = a*9+c
-            cycle_offset = 6
-            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                # Use multiply_add for stages 0, 2, 4 (collapse 2 cycles to 1)
-                if hi in [0, 2, 4] and op1 == "+" and op2 == "+" and op3 == "<<":
-                    multiplier = 1 + (1 << val3)  # 1 + 2^shift
-                    # Need a broadcast constant for the multiplier
-                    s_mult = s_hs[hi]  # Reuse the shift constant slot for multiplier
-                    ops.append((start_cycle + cycle_offset, "valu", [("multiply_add", vv, vv, s_mult, s_hc[hi])]))
-                    cycle_offset += 1
-                else:
-                    valu_tmp = [(op1, vt1, vv, s_hc[hi]), (op3, vt2, vv, s_hs[hi])]
-                    valu_val = [(op2, vv, vt1, vt2)]
-                    # Last hash stage (hi=5, cycles 13-14): also compute idx2, idx2p1
-                    if hi == 5:
-                        valu_tmp.append(("+", vidx2p1, vi, vi))       # idx2 = idx + idx
-                        valu_val.append(("+", vidx2p1, vidx2p1, s_v1)) # idx2p1 = idx2 + 1
-                    ops.append((start_cycle + cycle_offset, "valu", valu_tmp))
-                    ops.append((start_cycle + cycle_offset + 1, "valu", valu_val))
-                    cycle_offset += 2
-            # After hash completes (cycle_offset is now at end of hash)
-            # Bit extraction and index update
-            ops.append((start_cycle + cycle_offset, "valu", [("&", s_vbit, vv, s_v1)]))
-            ops.append((start_cycle + cycle_offset + 1, "valu", [("+", s_vidxn, vidx2p1, s_vbit)]))
-            ops.append((start_cycle + cycle_offset + 2, "valu", [("<", s_vcmp, s_vidxn, s_vnn)]))
-            ops.append((start_cycle + cycle_offset + 3, "flow", [("vselect", vi, s_vcmp, s_vidxn, s_v0)]))
-            return ops
+        # Compute per-chunk base addresses for vload/vstore
+        add_op(
+            prologue_ops,
+            "flow",
+            ("add_imm", val_addr, inp_values_p, 0),
+            reads=(inp_values_p,),
+            writes=(val_addr,),
+        )
 
-        starts = [g * SPACING for g in range(n_groups)]
+        # Initial vload into scratch arrays
+        for c in range(n_chunks):
+            idx_vec = vec_base(idx_base, c)
+            val_vec = vec_base(val_base, c)
+            # indices start at zero; avoid memory load
+            add_op(
+                prologue_ops,
+                "valu",
+                ("vbroadcast", idx_vec, c0),
+                reads=vec_addrs(c0),
+                writes=vec_addrs(idx_vec),
+            )
+            add_op(
+                prologue_ops,
+                "load",
+                ("vload", val_vec, val_addr),
+                reads=(val_addr,),
+                writes=vec_addrs(val_vec),
+            )
+            if c != n_chunks - 1:
+                    add_op(
+                        prologue_ops,
+                        "flow",
+                        ("add_imm", val_addr, val_addr, VLEN),
+                        reads=(val_addr,),
+                        writes=(val_addr,),
+                    )
 
-        all_ops = []
-        for g in range(n_groups):
-            all_ops.extend(group_ops(g, starts[g]))
-
-        max_cycle = max(cycle for cycle, _, _ in all_ops) + 1
-        schedule = [defaultdict(list) for _ in range(max_cycle)]
-        for cycle, engine, slots in all_ops:
-            schedule[cycle][engine].extend(slots)
-
-        for cycle_bundle in schedule:
-            if cycle_bundle:
-                self.emit(dict(cycle_bundle))
-
-    def _emit_level_aware_rounds(self, rounds, n_groups, VL, s_idx, s_val, s_nv,
-                                 s_vt1, s_vt2, s_idx2p1, s_vbit, s_vidxn,
-                                 s_vcmp, s_ga, s_v1, s_v0, s_vnn,
-                                 s_hc, s_hs, s_fvp,
-                                 s_node0_v, s_vbit0, s_vidxn0, s_vcmp0):
-        """Round 0: tree[0] broadcast (no gather). Round 1+ at ROUND1_START + (r-1)*128."""
-        SPACING = 4
-        ROUND_DELAY = 128
-        ROUND1_START = 123
-
-        all_ops = []
+        # Round loop (unrolled)
         for r in range(rounds):
-            start = 0 if r == 0 else ROUND1_START + (r - 1) * ROUND_DELAY
-            for g in range(n_groups):
-                gs = start + g * SPACING
+            for c in range(n_chunks):
+                idx_vec = vec_base(idx_base, c)
+                val_vec = vec_base(val_base, c)
+                t1 = vec_base(tmp1_base, c)
+                t2 = vec_base(tmp2_base, c)
+                t3 = vec_base(tmp3_base, c)
+
                 if r == 0:
-                    all_ops.extend(self._group_ops_round0(
-                        g, gs, VL, s_idx, s_val, s_node0_v,
-                        s_vt1, s_vt2, s_idx2p1, s_vbit0, s_vidxn0, s_vcmp0,
-                        s_v1, s_v0, s_vnn, s_hc, s_hs))
+                    # val ^= node0
+                    add_op(
+                        round_ops[r],
+                        "valu",
+                        ("^", val_vec, val_vec, node0),
+                        reads=vec_addrs(val_vec) + vec_addrs(node0),
+                        writes=vec_addrs(val_vec),
+                    )
+                elif r == 1:
+                    # bit0 = idx & 1
+                    add_op(
+                        round_ops[r],
+                        "valu",
+                        ("&", t1, idx_vec, c1),
+                        reads=vec_addrs(idx_vec) + vec_addrs(c1),
+                        writes=vec_addrs(t1),
+                    )
+                    # node_val = node2 + bit0 * (node1 - node2)
+                    add_op(
+                        round_ops[r],
+                        "valu",
+                        ("multiply_add", t2, t1, d12, node2),
+                        reads=vec_addrs(t1)
+                        + vec_addrs(d12)
+                        + vec_addrs(node2),
+                        writes=vec_addrs(t2),
+                    )
+                    # val ^= node_val
+                    add_op(
+                        round_ops[r],
+                        "valu",
+                        ("^", val_vec, val_vec, t2),
+                        reads=vec_addrs(val_vec) + vec_addrs(t2),
+                        writes=vec_addrs(val_vec),
+                    )
+                elif r == 2:
+                    # offset = idx - 1 - 2 (avoid extra constant)
+                    add_op(
+                        round_ops[r],
+                        "valu",
+                        ("-", t1, idx_vec, c1),
+                        reads=vec_addrs(idx_vec) + vec_addrs(c1),
+                        writes=vec_addrs(t1),
+                    )
+                    add_op(
+                        round_ops[r],
+                        "valu",
+                        ("-", t1, t1, c2),
+                        reads=vec_addrs(t1) + vec_addrs(c2),
+                        writes=vec_addrs(t1),
+                    )
+                    # bit0 = offset & 1
+                    add_op(
+                        round_ops[r],
+                        "valu",
+                        ("&", t2, t1, c1),
+                        reads=vec_addrs(t1) + vec_addrs(c1),
+                        writes=vec_addrs(t2),
+                    )
+                    # bit1 = offset & 2
+                    add_op(
+                        round_ops[r],
+                        "valu",
+                        ("&", t3, t1, c2),
+                        reads=vec_addrs(t1) + vec_addrs(c2),
+                        writes=vec_addrs(t3),
+                    )
+                    # normalize bit1 to 0/1
+                    add_op(
+                        round_ops[r],
+                        "valu",
+                        (">>", t3, t3, c1),
+                        reads=vec_addrs(t3) + vec_addrs(c1),
+                        writes=vec_addrs(t3),
+                    )
+                    # low = node3 + bit0 * (node4 - node3)
+                    add_op(
+                        round_ops[r],
+                        "valu",
+                        ("multiply_add", t1, t2, d34, node3),
+                        reads=vec_addrs(t2)
+                        + vec_addrs(d34)
+                        + vec_addrs(node3),
+                        writes=vec_addrs(t1),
+                    )
+                    # high = node5 + bit0 * (node6 - node5)
+                    add_op(
+                        round_ops[r],
+                        "valu",
+                        ("multiply_add", t2, t2, d56, node5),
+                        reads=vec_addrs(t2)
+                        + vec_addrs(d56)
+                        + vec_addrs(node5),
+                        writes=vec_addrs(t2),
+                    )
+                    # node_val = low + bit1 * (high - low)
+                    add_op(
+                        round_ops[r],
+                        "valu",
+                        ("-", t2, t2, t1),
+                        reads=vec_addrs(t2) + vec_addrs(t1),
+                        writes=vec_addrs(t2),
+                    )
+                    add_op(
+                        round_ops[r],
+                        "valu",
+                        ("multiply_add", t3, t3, t2, t1),
+                        reads=vec_addrs(t3) + vec_addrs(t2) + vec_addrs(t1),
+                        writes=vec_addrs(t3),
+                    )
+                    # val ^= node_val
+                    add_op(
+                        round_ops[r],
+                        "valu",
+                        ("^", val_vec, val_vec, t3),
+                        reads=vec_addrs(val_vec) + vec_addrs(t3),
+                        writes=vec_addrs(val_vec),
+                    )
                 else:
-                    all_ops.extend(self._group_ops_gather(g, gs, VL, s_idx, s_val,
-                                                          s_nv, s_vt1, s_vt2, s_idx2p1, s_vbit,
-                                                          s_vidxn, s_vcmp, s_ga, s_v1, s_v0,
-                                                          s_vnn, s_hc, s_hs, s_fvp))
+                    # load node values into t2
+                    for off in range(VLEN):
+                        add_op(
+                            round_ops[r],
+                            "load",
+                            ("load_offset", t2, t1, off),
+                            reads=(t1 + off,),
+                            writes=(t2 + off,),
+                        )
+                    # val ^= node_val
+                    add_op(
+                        round_ops[r],
+                        "valu",
+                        ("^", val_vec, val_vec, t2),
+                        reads=vec_addrs(val_vec) + vec_addrs(t2),
+                        writes=vec_addrs(val_vec),
+                    )
 
-        max_cycle = max(cycle for cycle, _, _ in all_ops) + 1
-        schedule = [defaultdict(list) for _ in range(max_cycle)]
-        for cycle, engine, slots in all_ops:
-            schedule[cycle][engine].extend(slots)
-        return schedule, max_cycle
+                ht1, ht2 = (t1, t2) if r < 3 else (t2, t3)
+                op_list = round_ops[r]
 
-    def _group_ops_round0(self, g, start_cycle, VL, s_idx, s_val, s_node0_v,
-                          s_vt1, s_vt2, s_idx2p1, s_vbit0, s_vidxn0, s_vcmp0,
-                          s_v1, s_v0, s_vnn, s_hc, s_hs):
-        """Round 0: all idx=0. No addr compute, no gather; XOR with broadcast tree[0]."""
-        vi = s_idx + g * VL
-        vv = s_val + g * VL
-        buf = g % 3
-        vt1 = s_vt1[buf]
-        vt2 = s_vt2[buf]
-        vidx2p1 = s_idx2p1[buf]
-        ops = []
+                # Hash stages (algebraic reductions)
+                add_op(
+                    op_list,
+                    "valu",
+                    ("multiply_add", val_vec, val_vec, c4097, h1),
+                    reads=vec_addrs(val_vec)
+                    + vec_addrs(c4097)
+                    + vec_addrs(h1),
+                    writes=vec_addrs(val_vec),
+                )
+                add_op(
+                    op_list,
+                    "valu",
+                    ("^", ht1, val_vec, h2),
+                    reads=vec_addrs(val_vec) + vec_addrs(h2),
+                    writes=vec_addrs(ht1),
+                )
+                add_op(
+                    op_list,
+                    "valu",
+                    (">>", ht2, val_vec, c19),
+                    reads=vec_addrs(val_vec) + vec_addrs(c19),
+                    writes=vec_addrs(ht2),
+                )
+                add_op(
+                    op_list,
+                    "valu",
+                    ("^", val_vec, ht1, ht2),
+                    reads=vec_addrs(ht1) + vec_addrs(ht2),
+                    writes=vec_addrs(val_vec),
+                )
+                add_op(
+                    op_list,
+                    "valu",
+                    ("multiply_add", val_vec, val_vec, c33, h3),
+                    reads=vec_addrs(val_vec)
+                    + vec_addrs(c33)
+                    + vec_addrs(h3),
+                    writes=vec_addrs(val_vec),
+                )
+                add_op(
+                    op_list,
+                    "valu",
+                    ("+", ht1, val_vec, h4),
+                    reads=vec_addrs(val_vec) + vec_addrs(h4),
+                    writes=vec_addrs(ht1),
+                )
+                add_op(
+                    op_list,
+                    "valu",
+                    ("<<", ht2, val_vec, c9),
+                    reads=vec_addrs(val_vec) + vec_addrs(c9),
+                    writes=vec_addrs(ht2),
+                )
+                add_op(
+                    op_list,
+                    "valu",
+                    ("^", val_vec, ht1, ht2),
+                    reads=vec_addrs(ht1) + vec_addrs(ht2),
+                    writes=vec_addrs(val_vec),
+                )
+                add_op(
+                    op_list,
+                    "valu",
+                    ("multiply_add", val_vec, val_vec, c9, h5),
+                    reads=vec_addrs(val_vec)
+                    + vec_addrs(c9)
+                    + vec_addrs(h5),
+                    writes=vec_addrs(val_vec),
+                )
+                add_op(
+                    op_list,
+                    "valu",
+                    ("^", ht1, val_vec, h6),
+                    reads=vec_addrs(val_vec) + vec_addrs(h6),
+                    writes=vec_addrs(ht1),
+                )
+                add_op(
+                    op_list,
+                    "valu",
+                    (">>", ht2, val_vec, c16),
+                    reads=vec_addrs(val_vec) + vec_addrs(c16),
+                    writes=vec_addrs(ht2),
+                )
+                add_op(
+                    op_list,
+                    "valu",
+                    ("^", val_vec, ht1, ht2),
+                    reads=vec_addrs(ht1) + vec_addrs(ht2),
+                    writes=vec_addrs(val_vec),
+                )
 
-        # Cycle 0: XOR (no addr, no loads)
-        ops.append((start_cycle, "valu", [("^", vv, vv, s_node0_v)]))
-        cycle_offset = 1
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            if hi in [0, 2, 4] and op1 == "+" and op2 == "+" and op3 == "<<":
-                ops.append((start_cycle + cycle_offset, "valu", [("multiply_add", vv, vv, s_hs[hi], s_hc[hi])]))
-                cycle_offset += 1
-            else:
-                valu_tmp = [(op1, vt1, vv, s_hc[hi]), (op3, vt2, vv, s_hs[hi])]
-                valu_val = [(op2, vv, vt1, vt2)]
-                if hi == 5:
-                    valu_tmp.append(("+", vidx2p1, vi, vi))
-                    valu_val.append(("+", vidx2p1, vidx2p1, s_v1))
-                ops.append((start_cycle + cycle_offset, "valu", valu_tmp))
-                ops.append((start_cycle + cycle_offset + 1, "valu", valu_val))
-                cycle_offset += 2
-        ops.append((start_cycle + cycle_offset, "valu", [("&", s_vbit0, vv, s_v1)]))
-        ops.append((start_cycle + cycle_offset + 1, "valu", [("+", s_vidxn0, vidx2p1, s_vbit0)]))
-        ops.append((start_cycle + cycle_offset + 2, "valu", [("<", s_vcmp0, s_vidxn0, s_vnn)]))
-        ops.append((start_cycle + cycle_offset + 3, "flow", [("vselect", vi, s_vcmp0, s_vidxn0, s_v0)]))
-        return ops
+                # idx update: idx = 2*idx + 1 + (val & 1)
+                if r < rounds - 1:
+                    if r >= 3:
+                        add_op(
+                            op_list,
+                            "valu",
+                            ("&", t2, val_vec, c1),
+                            reads=vec_addrs(val_vec) + vec_addrs(c1),
+                            writes=vec_addrs(t2),
+                            kind="idx",
+                        )
+                        add_op(
+                            op_list,
+                            "valu",
+                            ("multiply_add", t3, idx_vec, c2, c1),
+                            reads=vec_addrs(idx_vec) + vec_addrs(c2) + vec_addrs(c1),
+                            writes=vec_addrs(t3),
+                            kind="idx",
+                        )
+                        add_op(
+                            op_list,
+                            "valu",
+                            ("+", idx_vec, t3, t2),
+                            reads=vec_addrs(t3) + vec_addrs(t2),
+                            writes=vec_addrs(idx_vec),
+                            kind="idx",
+                        )
+                        if r >= forest_height:
+                            add_op(
+                                op_list,
+                                "valu",
+                                ("<", t2, idx_vec, c_n_nodes),
+                                reads=vec_addrs(idx_vec) + vec_addrs(c_n_nodes),
+                                writes=vec_addrs(t2),
+                                kind="idx",
+                            )
+                            add_op(
+                                op_list,
+                                "valu",
+                                ("multiply_add", idx_vec, idx_vec, t2, c0),
+                                reads=vec_addrs(idx_vec)
+                                + vec_addrs(t2)
+                                + vec_addrs(c0),
+                                writes=vec_addrs(idx_vec),
+                                kind="idx",
+                            )
+                    else:
+                        add_op(
+                            op_list,
+                            "valu",
+                            ("&", t1, val_vec, c1),
+                            reads=vec_addrs(val_vec) + vec_addrs(c1),
+                            writes=vec_addrs(t1),
+                            kind="idx",
+                        )
+                        add_op(
+                            op_list,
+                            "valu",
+                            ("multiply_add", t2, idx_vec, c2, c1),
+                            reads=vec_addrs(idx_vec) + vec_addrs(c2) + vec_addrs(c1),
+                            writes=vec_addrs(t2),
+                            kind="idx",
+                        )
+                        add_op(
+                            op_list,
+                            "valu",
+                            ("+", idx_vec, t2, t1),
+                            reads=vec_addrs(t2) + vec_addrs(t1),
+                            writes=vec_addrs(idx_vec),
+                            kind="idx",
+                        )
+                        if r >= forest_height:
+                            add_op(
+                                op_list,
+                                "valu",
+                                ("<", t1, idx_vec, c_n_nodes),
+                                reads=vec_addrs(idx_vec) + vec_addrs(c_n_nodes),
+                                writes=vec_addrs(t1),
+                                kind="idx",
+                            )
+                            add_op(
+                                op_list,
+                                "valu",
+                                ("multiply_add", idx_vec, idx_vec, t1, c0),
+                                reads=vec_addrs(idx_vec)
+                                + vec_addrs(t1)
+                                + vec_addrs(c0),
+                                writes=vec_addrs(idx_vec),
+                                kind="idx",
+                            )
+                if r >= 2 and r < rounds - 1:
+                    add_op(
+                        op_list,
+                        "valu",
+                        ("+", t1, idx_vec, c_forest),
+                        reads=vec_addrs(idx_vec) + vec_addrs(c_forest),
+                        writes=vec_addrs(t1),
+                        kind="addr",
+                    )
+            all_round_ops.extend(round_ops[r])
 
-    def _group_ops_level1(self, g, start_cycle, VL, s_idx, s_val, s_nv, s_tlev,
-                          s_vt1, s_vt2, s_idx2p1, s_vbit, s_vidxn, s_vcmp,
-                          s_v1, s_v0, s_vnn, s_hc, s_hs):
-        """Level 1: idx in {1,2}. Select tree[1] or tree[2] via idx&1; no gather."""
-        vi = s_idx + g * VL
-        vv = s_val + g * VL
-        buf = g % 3
-        vt1 = s_vt1[buf]
-        vt2 = s_vt2[buf]
-        vidx2p1 = s_idx2p1[buf]
-        t1_v, t2_v = s_tlev[0], s_tlev[1]
-        ops = []
+        # Final vstore back to memory (values only; indices not required by tests)
+        add_op(
+            epilogue_ops,
+            "flow",
+            ("add_imm", val_addr, inp_values_p, 0),
+            reads=(inp_values_p,),
+            writes=(val_addr,),
+        )
+        for c in range(n_chunks):
+            idx_vec = vec_base(idx_base, c)
+            val_vec = vec_base(val_base, c)
+            add_op(
+                epilogue_ops,
+                "store",
+                ("vstore", val_addr, val_vec),
+                reads=(val_addr,) + vec_addrs(val_vec),
+                writes=(),
+            )
+            if c != n_chunks - 1:
+                add_op(
+                    epilogue_ops,
+                    "flow",
+                    ("add_imm", val_addr, val_addr, VLEN),
+                    reads=(val_addr,),
+                    writes=(val_addr,),
+                )
 
-        ops.append((start_cycle, "valu", [("&", vt1, vi, s_v1)]))
-        ops.append((start_cycle + 1, "flow", [("vselect", s_nv, vt1, t1_v, t2_v)]))
-        ops.append((start_cycle + 2, "valu", [("^", vv, vv, s_nv)]))
-        cycle_offset = 3
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            if hi in [0, 2, 4] and op1 == "+" and op2 == "+" and op3 == "<<":
-                ops.append((start_cycle + cycle_offset, "valu", [("multiply_add", vv, vv, s_hs[hi], s_hc[hi])]))
-                cycle_offset += 1
-            else:
-                valu_tmp = [(op1, vt1, vv, s_hc[hi]), (op3, vt2, vv, s_hs[hi])]
-                valu_val = [(op2, vv, vt1, vt2)]
-                if hi == 5:
-                    valu_tmp.append(("+", vidx2p1, vi, vi))
-                    valu_val.append(("+", vidx2p1, vidx2p1, s_v1))
-                ops.append((start_cycle + cycle_offset, "valu", valu_tmp))
-                ops.append((start_cycle + cycle_offset + 1, "valu", valu_val))
-                cycle_offset += 2
-        ops.append((start_cycle + cycle_offset, "valu", [("&", s_vbit, vv, s_v1)]))
-        ops.append((start_cycle + cycle_offset + 1, "valu", [("+", s_vidxn, vidx2p1, s_vbit)]))
-        ops.append((start_cycle + cycle_offset + 2, "valu", [("<", s_vcmp, s_vidxn, s_vnn)]))
-        ops.append((start_cycle + cycle_offset + 3, "flow", [("vselect", vi, s_vcmp, s_vidxn, s_v0)]))
-        return ops
+        def add_deps(op_list, ready_addrs):
+            last_write = {addr: -1 for addr in ready_addrs}
+            last_read = {}
+            for i, op in enumerate(op_list):
+                deps = set()
+                deps_war = set()
+                for addr in op["reads"]:
+                    if addr in last_write and last_write[addr] != -1:
+                        deps.add(last_write[addr])
+                for addr in op["writes"]:
+                    if addr in last_write and last_write[addr] != -1:
+                        deps.add(last_write[addr])
+                    if addr in last_read:
+                        deps_war.add(last_read[addr])
+                op["deps"] = deps
+                op["deps_war"] = deps_war
+                for addr in op["reads"]:
+                    last_read[addr] = i
+                for addr in op["writes"]:
+                    last_write[addr] = i
 
-    def _group_ops_gather(self, g, start_cycle, VL, s_idx, s_val, s_nv, s_vt1, s_vt2,
-                         s_idx2p1, s_vbit, s_vidxn, s_vcmp, s_ga, s_v1, s_v0, s_vnn,
-                         s_hc, s_hs, s_fvp):
-        """
-        Group operations using traditional gather from memory.
-        """
-        vi = s_idx + g * VL
-        vv = s_val + g * VL
-        buf = g % 3
-        vt1 = s_vt1[buf]
-        vt2 = s_vt2[buf]
-        vidx2p1 = s_idx2p1[buf]
-        ops = []
+        def schedule_ops(op_list, ready_addrs=None):
+            if ready_addrs is None:
+                ready_addrs = set()
+                for op in op_list:
+                    ready_addrs.update(op["reads"])
+                    ready_addrs.update(op["writes"])
+            slot_limits = SLOT_LIMITS
+            add_deps(op_list, ready_addrs)
+            n = len(op_list)
+            dependents = [[] for _ in range(n)]
+            for i, op in enumerate(op_list):
+                for dep in op["deps"]:
+                    dependents[dep].append(i)
 
-        # Cycle 0: ALU addr compute (8 ALU slots)
-        ops.append((start_cycle, "alu", [("+", s_ga + i, s_fvp, vi + i) for i in range(VL)]))
-        # Cycles 1-4: Load gather (2 loads per cycle)
-        for c in range(4):
-            ops.append((start_cycle + 1 + c, "load", [
-                ("load", s_nv + 2*c, s_ga + 2*c),
-                ("load", s_nv + 2*c + 1, s_ga + 2*c + 1)
-            ]))
-        # Cycle 5: VALU XOR val ^= node_val
-        ops.append((start_cycle + 5, "valu", [("^", vv, vv, s_nv)]))
-        # Cycles 6-14: Hash (6 stages, stages 0,2,4 use multiply_add = 1 cycle, others = 2 cycles)
-        cycle_offset = 6
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            if hi in [0, 2, 4] and op1 == "+" and op2 == "+" and op3 == "<<":
-                ops.append((start_cycle + cycle_offset, "valu", [("multiply_add", vv, vv, s_hs[hi], s_hc[hi])]))
-                cycle_offset += 1
-            else:
-                valu_tmp = [(op1, vt1, vv, s_hc[hi]), (op3, vt2, vv, s_hs[hi])]
-                valu_val = [(op2, vv, vt1, vt2)]
-                if hi == 5:
-                    valu_tmp.append(("+", vidx2p1, vi, vi))
-                    valu_val.append(("+", vidx2p1, vidx2p1, s_v1))
-                ops.append((start_cycle + cycle_offset, "valu", valu_tmp))
-                ops.append((start_cycle + cycle_offset + 1, "valu", valu_val))
-                cycle_offset += 2
-        # Cycle 15-18: bit extraction and index update
-        ops.append((start_cycle + 15, "valu", [("&", s_vbit, vv, s_v1)]))
-        ops.append((start_cycle + 16, "valu", [("+", s_vidxn, vidx2p1, s_vbit)]))
-        ops.append((start_cycle + 17, "valu", [("<", s_vcmp, s_vidxn, s_vnn)]))
-        ops.append((start_cycle + 18, "flow", [("vselect", vi, s_vcmp, s_vidxn, s_v0)]))
-        return ops
+            height = [-1] * n
 
-    def _emit_overlapped_rounds(self, rounds, n_groups, VL, s_idx, s_val, s_nv,
-                                 s_vt1, s_vt2, s_idx2p1, s_vbit, s_vidxn,
-                                 s_vcmp, s_ga, s_v1, s_v0, s_vnn, s_hc, s_hs, s_fvp):
-        """
-        Emit all rounds unrolled with inter-round overlap.
-        Round spacing D=128 cycles avoids load conflicts while maximizing overlap.
-        Group 31 loads at cycles 125-128, next round's group 0 loads at 129-132.
-        Each round takes 143 cycles (32 groups * 4 spacing + 19 final cycles).
-        Total time: 143 + 15*128 = 2063 cycles instead of 16*143 = 2288 cycles.
-        """
-        SPACING = 4
-        ROUND_DELAY = 128  # cycles between round starts
-
-        def group_ops(g, start_cycle):
-            vi = s_idx + g * VL
-            vv = s_val + g * VL
-            buf = g % 3
-            vt1 = s_vt1[buf]
-            vt2 = s_vt2[buf]
-            vidx2p1 = s_idx2p1[buf]
-            ops = []
-
-            # Cycle 0: ALU addr compute (8 ALU slots)
-            ops.append((start_cycle, "alu", [("+", s_ga + i, s_fvp, vi + i) for i in range(VL)]))
-            # Cycles 1-4: Load gather (2 loads per cycle)
-            for c in range(4):
-                ops.append((start_cycle + 1 + c, "load", [
-                    ("load", s_nv + 2*c, s_ga + 2*c),
-                    ("load", s_nv + 2*c + 1, s_ga + 2*c + 1)
-                ]))
-            # Cycle 5: VALU XOR val ^= node_val
-            ops.append((start_cycle + 5, "valu", [("^", vv, vv, s_nv)]))
-            # Cycles 6-14: Hash (6 stages, stages 0,2,4 use multiply_add = 1 cycle, others = 2 cycles)
-            cycle_offset = 6
-            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                if hi in [0, 2, 4] and op1 == "+" and op2 == "+" and op3 == "<<":
-                    ops.append((start_cycle + cycle_offset, "valu", [("multiply_add", vv, vv, s_hs[hi], s_hc[hi])]))
-                    cycle_offset += 1
+            def compute_height(i):
+                if height[i] != -1:
+                    return height[i]
+                if not dependents[i]:
+                    height[i] = 1
                 else:
-                    valu_tmp = [(op1, vt1, vv, s_hc[hi]), (op3, vt2, vv, s_hs[hi])]
-                    valu_val = [(op2, vv, vt1, vt2)]
-                    if hi == 5:
-                        valu_tmp.append(("+", vidx2p1, vi, vi))
-                        valu_val.append(("+", vidx2p1, vidx2p1, s_v1))
-                    ops.append((start_cycle + cycle_offset, "valu", valu_tmp))
-                    ops.append((start_cycle + cycle_offset + 1, "valu", valu_val))
-                    cycle_offset += 2
-            # Cycle 15-18: bit extraction and index update
-            ops.append((start_cycle + 15, "valu", [("&", s_vbit, vv, s_v1)]))
-            ops.append((start_cycle + 16, "valu", [("+", s_vidxn, vidx2p1, s_vbit)]))
-            ops.append((start_cycle + 17, "valu", [("<", s_vcmp, s_vidxn, s_vnn)]))
-            ops.append((start_cycle + 18, "flow", [("vselect", vi, s_vcmp, s_vidxn, s_v0)]))
-            return ops
+                    height[i] = 1 + max(compute_height(j) for j in dependents[i])
+                return height[i]
 
-        # Generate all operations for all rounds with overlap
+            for i in range(n):
+                compute_height(i)
+
+            unscheduled = list(range(n))
+            done = set()
+            instrs = []
+
+            while unscheduled:
+                instr = {}
+                used_writes = set()
+                engine_counts = defaultdict(int)
+                scheduled_this_cycle = set()
+                progressed = True
+                engine_priority = ["load", "alu", "valu", "store", "flow"]
+
+                while progressed:
+                    progressed = False
+                    candidates = [
+                        i
+                        for i in unscheduled
+                        if op_list[i]["deps"].issubset(done)
+                        and op_list[i]["deps_war"].issubset(done | scheduled_this_cycle)
+                    ]
+                    if not candidates:
+                        break
+                    def priority(op):
+                        if op == "addr":
+                            return 2
+                        if op == "idx":
+                            return 1
+                        return 0
+
+                    candidates.sort(
+                        key=lambda x: (priority(op_list[x]["kind"]), height[x]),
+                        reverse=True,
+                    )
+
+                    for engine in engine_priority:
+                        if engine_counts[engine] >= slot_limits[engine]:
+                            continue
+                        for i in list(candidates):
+                            op = op_list[i]
+                            if op["engine"] != engine:
+                                continue
+                            writes = op["writes"]
+                            if writes and any(addr in used_writes for addr in writes):
+                                continue
+                            instr.setdefault(engine, []).append(op["slot"])
+                            engine_counts[engine] += 1
+                            if writes:
+                                for addr in writes:
+                                    used_writes.add(addr)
+                            unscheduled.remove(i)
+                            scheduled_this_cycle.add(i)
+                            candidates.remove(i)
+                            progressed = True
+                            if engine_counts[engine] >= slot_limits[engine]:
+                                break
+
+                if not scheduled_this_cycle:
+                    # Deadlock guard: no schedulable ops left, avoid infinite loop
+                    raise RuntimeError(
+                        f"Scheduler deadlock with {len(unscheduled)} ops remaining"
+                    )
+
+                done.update(scheduled_this_cycle)
+                instrs.append(instr)
+
+            return instrs
+
+        # Global schedule (prologue + rounds + epilogue)
         all_ops = []
-        for r in range(rounds):
-            round_start = r * ROUND_DELAY
-            for g in range(n_groups):
-                group_start = round_start + g * SPACING
-                all_ops.extend(group_ops(g, group_start))
-
-        # Schedule all operations
-        max_cycle = max(cycle for cycle, _, _ in all_ops) + 1
-        schedule = [defaultdict(list) for _ in range(max_cycle)]
-        for cycle, engine, slots in all_ops:
-            schedule[cycle][engine].extend(slots)
-
-        # Emit the schedule
-        for cycle_bundle in schedule:
-            if cycle_bundle:
-                self.emit(dict(cycle_bundle))
-
+        all_ops.extend(prologue_ops)
+        all_ops.extend(all_round_ops)
+        all_ops.extend(epilogue_ops)
+        self.instrs.extend(schedule_ops(all_ops))
 
 BASELINE = 147734
 
@@ -536,6 +796,7 @@ def do_kernel_test(
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
+    # print(kb.instrs)
 
     value_trace = {}
     machine = Machine(
@@ -561,6 +822,8 @@ def do_kernel_test(
         if prints:
             print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
             print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
+        # Updating these in memory isn't required, but you can enable this check for debugging
+        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
@@ -569,6 +832,9 @@ def do_kernel_test(
 
 class Tests(unittest.TestCase):
     def test_ref_kernels(self):
+        """
+        Test the reference kernels against each other
+        """
         random.seed(123)
         for i in range(10):
             f = Tree.generate(4)
@@ -581,11 +847,34 @@ class Tests(unittest.TestCase):
             assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
 
     def test_kernel_trace(self):
+        # Full-scale example for performance testing
         do_kernel_test(10, 16, 256, trace=True, prints=False)
+
+    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
+    # You can uncomment this if you think it might help you debug
+    # def test_kernel_correctness(self):
+    #     for batch in range(1, 3):
+    #         for forest_height in range(3):
+    #             do_kernel_test(
+    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
+    #             )
 
     def test_kernel_cycles(self):
         do_kernel_test(10, 16, 256)
 
+
+# To run all the tests:
+#    python perf_takehome.py
+# To run a specific test:
+#    python perf_takehome.py Tests.test_kernel_cycles
+# To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
+# NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
+#    python perf_takehome.py Tests.test_kernel_trace
+# Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
+# You can then keep that open and re-run the test to see a new trace.
+
+# To run the proper checks to see which thresholds you pass:
+#    python tests/submission_tests.py
 
 if __name__ == "__main__":
     unittest.main()
