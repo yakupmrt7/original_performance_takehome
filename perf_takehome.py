@@ -109,6 +109,7 @@ class KernelBuilder:
 
         # Scratch layout
         tmp_scalar = self.alloc_scratch("tmp_scalar")
+        tmp_scalar2 = self.alloc_scratch("tmp_scalar2")  # For parallel const loading
 
         idx_base = self.alloc_scratch("idx_vec", batch_size)
         val_base = self.alloc_scratch("val_vec", batch_size)
@@ -131,6 +132,7 @@ class KernelBuilder:
         c0 = alloc_vec_const("v0")
         c1 = alloc_vec_const("v1")
         c2 = alloc_vec_const("v2")
+        c3 = alloc_vec_const("v3")  # For round 2 offset computation
         c9 = alloc_vec_const("v9")
         c16 = alloc_vec_const("v16")
         c19 = alloc_vec_const("v19")
@@ -152,7 +154,7 @@ class KernelBuilder:
         node4 = alloc_vec_const("node4")
         node5 = alloc_vec_const("node5")
         node6 = alloc_vec_const("node6")
-        # (no extra node xor constants)
+        # Differences for branchless selects
         d12 = alloc_vec_const("node1_minus_node2")
         d34 = alloc_vec_const("node4_minus_node3")
         d56 = alloc_vec_const("node6_minus_node5")
@@ -163,6 +165,9 @@ class KernelBuilder:
         epilogue_ops = []
 
         def add_op(op_list, engine, slot, reads=(), writes=(), kind=None):
+            # Auto-tag loads for priority scheduling
+            if engine == "load" and kind is None:
+                kind = "load"
             op_list.append(
                 {
                     "engine": engine,
@@ -175,21 +180,34 @@ class KernelBuilder:
 
         # Load scalar constants/pointers
         add_op(prologue_ops, "load", ("const", inp_values_p, 2310), writes=(inp_values_p,))
+        
+        # Initialize val_addr early so vloads can start sooner
+        add_op(
+            prologue_ops,
+            "flow",
+            ("add_imm", val_addr, inp_values_p, 0),
+            reads=(inp_values_p,),
+            writes=(val_addr,),
+        )
 
-        # Broadcast vector constants
+        # Broadcast vector constants - use alternating tmp scalars for parallel loading
+        vbroadcast_counter = [0]
         def vbroadcast(dest, val):
-            add_op(prologue_ops, "load", ("const", tmp_scalar, val), writes=(tmp_scalar,))
+            ts = tmp_scalar if vbroadcast_counter[0] % 2 == 0 else tmp_scalar2
+            vbroadcast_counter[0] += 1
+            add_op(prologue_ops, "load", ("const", ts, val), writes=(ts,))
             add_op(
                 prologue_ops,
                 "valu",
-                ("vbroadcast", dest, tmp_scalar),
-                reads=(tmp_scalar,),
+                ("vbroadcast", dest, ts),
+                reads=(ts,),
                 writes=vec_addrs(dest),
             )
 
         vbroadcast(c0, 0)
         vbroadcast(c1, 1)
         vbroadcast(c2, 2)
+        vbroadcast(c3, 3)
         vbroadcast(c9, 9)
         vbroadcast(c16, 16)
         vbroadcast(c19, 19)
@@ -205,21 +223,23 @@ class KernelBuilder:
         vbroadcast(h5, 0xFD7046C5)
         vbroadcast(h6, 0xB55A4F09)
 
-        # Load node constants (nodes 0..6) and broadcast
-        for nid, dest in enumerate([node0, node1, node2, node3, node4, node5, node6]):
-            add_op(prologue_ops, "load", ("const", tmp_scalar, 7 + nid), writes=(tmp_scalar,))
+        # Load node constants (nodes 0..6) and broadcast - alternate tmp scalars
+        node_list = [node0, node1, node2, node3, node4, node5, node6]
+        for nid, dest in enumerate(node_list):
+            ts = tmp_scalar if nid % 2 == 0 else tmp_scalar2
+            add_op(prologue_ops, "load", ("const", ts, 7 + nid), writes=(ts,))
             add_op(
                 prologue_ops,
                 "load",
-                ("load", tmp_scalar, tmp_scalar),
-                reads=(tmp_scalar,),
-                writes=(tmp_scalar,),
+                ("load", ts, ts),
+                reads=(ts,),
+                writes=(ts,),
             )
             add_op(
                 prologue_ops,
                 "valu",
-                ("vbroadcast", dest, tmp_scalar),
-                reads=(tmp_scalar,),
+                ("vbroadcast", dest, ts),
+                reads=(ts,),
                 writes=vec_addrs(dest),
             )
         # Precompute small diffs for branchless selects in early rounds
@@ -248,16 +268,7 @@ class KernelBuilder:
 
 
 
-        # Compute per-chunk base addresses for vload/vstore
-        add_op(
-            prologue_ops,
-            "flow",
-            ("add_imm", val_addr, inp_values_p, 0),
-            reads=(inp_values_p,),
-            writes=(val_addr,),
-        )
-
-        # Initial vload into scratch arrays
+        # Initial vload into scratch arrays (val_addr already initialized above)
         for c in range(n_chunks):
             idx_vec = vec_base(idx_base, c)
             val_vec = vec_base(val_base, c)
@@ -302,6 +313,7 @@ class KernelBuilder:
                         ("^", val_vec, val_vec, node0),
                         reads=vec_addrs(val_vec) + vec_addrs(node0),
                         writes=vec_addrs(val_vec),
+                        
                     )
                 elif r == 1:
                     # bit0 = idx & 1
@@ -311,6 +323,7 @@ class KernelBuilder:
                         ("&", t1, idx_vec, c1),
                         reads=vec_addrs(idx_vec) + vec_addrs(c1),
                         writes=vec_addrs(t1),
+                        
                     )
                     # node_val = node2 + bit0 * (node1 - node2)
                     add_op(
@@ -321,6 +334,7 @@ class KernelBuilder:
                         + vec_addrs(d12)
                         + vec_addrs(node2),
                         writes=vec_addrs(t2),
+                        
                     )
                     # val ^= node_val
                     add_op(
@@ -329,22 +343,17 @@ class KernelBuilder:
                         ("^", val_vec, val_vec, t2),
                         reads=vec_addrs(val_vec) + vec_addrs(t2),
                         writes=vec_addrs(val_vec),
+                        
                     )
                 elif r == 2:
-                    # offset = idx - 1 - 2 (avoid extra constant)
+                    # offset = idx - 3
                     add_op(
                         round_ops[r],
                         "valu",
-                        ("-", t1, idx_vec, c1),
-                        reads=vec_addrs(idx_vec) + vec_addrs(c1),
+                        ("-", t1, idx_vec, c3),
+                        reads=vec_addrs(idx_vec) + vec_addrs(c3),
                         writes=vec_addrs(t1),
-                    )
-                    add_op(
-                        round_ops[r],
-                        "valu",
-                        ("-", t1, t1, c2),
-                        reads=vec_addrs(t1) + vec_addrs(c2),
-                        writes=vec_addrs(t1),
+                        
                     )
                     # bit0 = offset & 1
                     add_op(
@@ -353,6 +362,7 @@ class KernelBuilder:
                         ("&", t2, t1, c1),
                         reads=vec_addrs(t1) + vec_addrs(c1),
                         writes=vec_addrs(t2),
+                        
                     )
                     # bit1 = offset & 2
                     add_op(
@@ -361,6 +371,7 @@ class KernelBuilder:
                         ("&", t3, t1, c2),
                         reads=vec_addrs(t1) + vec_addrs(c2),
                         writes=vec_addrs(t3),
+                        
                     )
                     # normalize bit1 to 0/1
                     add_op(
@@ -369,6 +380,7 @@ class KernelBuilder:
                         (">>", t3, t3, c1),
                         reads=vec_addrs(t3) + vec_addrs(c1),
                         writes=vec_addrs(t3),
+                        
                     )
                     # low = node3 + bit0 * (node4 - node3)
                     add_op(
@@ -379,6 +391,7 @@ class KernelBuilder:
                         + vec_addrs(d34)
                         + vec_addrs(node3),
                         writes=vec_addrs(t1),
+                        
                     )
                     # high = node5 + bit0 * (node6 - node5)
                     add_op(
@@ -389,6 +402,7 @@ class KernelBuilder:
                         + vec_addrs(d56)
                         + vec_addrs(node5),
                         writes=vec_addrs(t2),
+                        
                     )
                     # node_val = low + bit1 * (high - low)
                     add_op(
@@ -397,6 +411,7 @@ class KernelBuilder:
                         ("-", t2, t2, t1),
                         reads=vec_addrs(t2) + vec_addrs(t1),
                         writes=vec_addrs(t2),
+                        
                     )
                     add_op(
                         round_ops[r],
@@ -404,6 +419,7 @@ class KernelBuilder:
                         ("multiply_add", t3, t3, t2, t1),
                         reads=vec_addrs(t3) + vec_addrs(t2) + vec_addrs(t1),
                         writes=vec_addrs(t3),
+                        
                     )
                     # val ^= node_val
                     add_op(
@@ -412,6 +428,7 @@ class KernelBuilder:
                         ("^", val_vec, val_vec, t3),
                         reads=vec_addrs(val_vec) + vec_addrs(t3),
                         writes=vec_addrs(val_vec),
+                        
                     )
                 else:
                     # load node values into t2
@@ -430,6 +447,7 @@ class KernelBuilder:
                         ("^", val_vec, val_vec, t2),
                         reads=vec_addrs(val_vec) + vec_addrs(t2),
                         writes=vec_addrs(val_vec),
+                        
                     )
 
                 ht1, ht2 = (t1, t2) if r < 3 else (t2, t3)
@@ -444,6 +462,7 @@ class KernelBuilder:
                     + vec_addrs(c4097)
                     + vec_addrs(h1),
                     writes=vec_addrs(val_vec),
+                    kind="hash",
                 )
                 add_op(
                     op_list,
@@ -451,6 +470,7 @@ class KernelBuilder:
                     ("^", ht1, val_vec, h2),
                     reads=vec_addrs(val_vec) + vec_addrs(h2),
                     writes=vec_addrs(ht1),
+                    kind="hash",
                 )
                 add_op(
                     op_list,
@@ -458,6 +478,7 @@ class KernelBuilder:
                     (">>", ht2, val_vec, c19),
                     reads=vec_addrs(val_vec) + vec_addrs(c19),
                     writes=vec_addrs(ht2),
+                    kind="hash",
                 )
                 add_op(
                     op_list,
@@ -465,6 +486,7 @@ class KernelBuilder:
                     ("^", val_vec, ht1, ht2),
                     reads=vec_addrs(ht1) + vec_addrs(ht2),
                     writes=vec_addrs(val_vec),
+                    kind="hash",
                 )
                 add_op(
                     op_list,
@@ -474,6 +496,7 @@ class KernelBuilder:
                     + vec_addrs(c33)
                     + vec_addrs(h3),
                     writes=vec_addrs(val_vec),
+                    kind="hash",
                 )
                 add_op(
                     op_list,
@@ -481,6 +504,7 @@ class KernelBuilder:
                     ("+", ht1, val_vec, h4),
                     reads=vec_addrs(val_vec) + vec_addrs(h4),
                     writes=vec_addrs(ht1),
+                    kind="hash",
                 )
                 add_op(
                     op_list,
@@ -488,6 +512,7 @@ class KernelBuilder:
                     ("<<", ht2, val_vec, c9),
                     reads=vec_addrs(val_vec) + vec_addrs(c9),
                     writes=vec_addrs(ht2),
+                    kind="hash",
                 )
                 add_op(
                     op_list,
@@ -495,6 +520,7 @@ class KernelBuilder:
                     ("^", val_vec, ht1, ht2),
                     reads=vec_addrs(ht1) + vec_addrs(ht2),
                     writes=vec_addrs(val_vec),
+                    kind="hash",
                 )
                 add_op(
                     op_list,
@@ -504,6 +530,7 @@ class KernelBuilder:
                     + vec_addrs(c9)
                     + vec_addrs(h5),
                     writes=vec_addrs(val_vec),
+                    kind="hash",
                 )
                 add_op(
                     op_list,
@@ -511,6 +538,7 @@ class KernelBuilder:
                     ("^", ht1, val_vec, h6),
                     reads=vec_addrs(val_vec) + vec_addrs(h6),
                     writes=vec_addrs(ht1),
+                    kind="hash",
                 )
                 add_op(
                     op_list,
@@ -518,6 +546,7 @@ class KernelBuilder:
                     (">>", ht2, val_vec, c16),
                     reads=vec_addrs(val_vec) + vec_addrs(c16),
                     writes=vec_addrs(ht2),
+                    kind="hash",
                 )
                 add_op(
                     op_list,
@@ -525,6 +554,7 @@ class KernelBuilder:
                     ("^", val_vec, ht1, ht2),
                     reads=vec_addrs(ht1) + vec_addrs(ht2),
                     writes=vec_addrs(val_vec),
+                    kind="hash",
                 )
 
                 # idx update: idx = 2*idx + 1 + (val & 1)
@@ -712,7 +742,7 @@ class KernelBuilder:
                 instr = {}
                 used_writes = set()
                 engine_counts = defaultdict(int)
-                scheduled_this_cycle = set()
+                scheduled_this_cycle = []
                 progressed = True
                 engine_priority = ["load", "alu", "valu", "store", "flow"]
 
@@ -722,19 +752,22 @@ class KernelBuilder:
                         i
                         for i in unscheduled
                         if op_list[i]["deps"].issubset(done)
-                        and op_list[i]["deps_war"].issubset(done | scheduled_this_cycle)
                     ]
                     if not candidates:
                         break
                     def priority(op):
+                        if op == "hash":
+                            return 5
                         if op == "addr":
-                            return 2
+                            return 4
+                        if op == "load":
+                            return 3
                         if op == "idx":
-                            return 1
-                        return 0
+                            return 2
+                        return 1
 
                     candidates.sort(
-                        key=lambda x: (priority(op_list[x]["kind"]), height[x]),
+                        key=lambda x: (priority(op_list[x]["kind"]), height[x], -x),
                         reverse=True,
                     )
 
@@ -748,25 +781,128 @@ class KernelBuilder:
                             writes = op["writes"]
                             if writes and any(addr in used_writes for addr in writes):
                                 continue
-                            instr.setdefault(engine, []).append(op["slot"])
                             engine_counts[engine] += 1
                             if writes:
                                 for addr in writes:
                                     used_writes.add(addr)
                             unscheduled.remove(i)
-                            scheduled_this_cycle.add(i)
+                            scheduled_this_cycle.append(i)
                             candidates.remove(i)
                             progressed = True
                             if engine_counts[engine] >= slot_limits[engine]:
                                 break
 
+                # Ensure WAR deps are satisfied within this cycle (or done)
+                if scheduled_this_cycle:
+                    scheduled_set = set(scheduled_this_cycle)
+                    changed = True
+                    while changed:
+                        changed = False
+                        for i in list(scheduled_set):
+                            if not op_list[i]["deps_war"].issubset(done | scheduled_set):
+                                scheduled_set.remove(i)
+                                unscheduled.append(i)
+                                changed = True
+                        if changed:
+                            # Recompute engine usage and write conflicts
+                            engine_counts = defaultdict(int)
+                            used_writes = set()
+                            for i in scheduled_set:
+                                op = op_list[i]
+                                engine_counts[op["engine"]] += 1
+                                for addr in op["writes"]:
+                                    used_writes.add(addr)
+                    scheduled_this_cycle = list(scheduled_set)
+
+                    # Fill remaining slots with strict WAR-safe ops
+                    progressed = True
+                    while progressed:
+                        progressed = False
+                        candidates = [
+                            i
+                            for i in unscheduled
+                            if op_list[i]["deps"].issubset(done)
+                            and op_list[i]["deps_war"].issubset(done | scheduled_set)
+                        ]
+                        if not candidates:
+                            break
+                        candidates.sort(
+                            key=lambda x: (priority(op_list[x]["kind"]), height[x], -x),
+                            reverse=True,
+                        )
+                        for engine in engine_priority:
+                            if engine_counts[engine] >= slot_limits[engine]:
+                                continue
+                            for i in list(candidates):
+                                op = op_list[i]
+                                if op["engine"] != engine:
+                                    continue
+                                writes = op["writes"]
+                                if writes and any(addr in used_writes for addr in writes):
+                                    continue
+                                engine_counts[engine] += 1
+                                if writes:
+                                    for addr in writes:
+                                        used_writes.add(addr)
+                                unscheduled.remove(i)
+                                scheduled_set.add(i)
+                                candidates.remove(i)
+                                progressed = True
+                                if engine_counts[engine] >= slot_limits[engine]:
+                                    break
+                    scheduled_this_cycle = list(scheduled_set)
+
                 if not scheduled_this_cycle:
-                    # Deadlock guard: no schedulable ops left, avoid infinite loop
-                    raise RuntimeError(
-                        f"Scheduler deadlock with {len(unscheduled)} ops remaining"
-                    )
+                    # Fallback: strict WAR scheduling to avoid deadlock
+                    used_writes = set()
+                    engine_counts = defaultdict(int)
+                    scheduled_strict = set()
+                    progressed = True
+                    while progressed:
+                        progressed = False
+                        candidates = [
+                            i
+                            for i in unscheduled
+                            if op_list[i]["deps"].issubset(done)
+                            and op_list[i]["deps_war"].issubset(done | scheduled_strict)
+                        ]
+                        if not candidates:
+                            break
+                        candidates.sort(
+                            key=lambda x: (priority(op_list[x]["kind"]), height[x], -x),
+                            reverse=True,
+                        )
+                        for engine in engine_priority:
+                            if engine_counts[engine] >= slot_limits[engine]:
+                                continue
+                            for i in list(candidates):
+                                op = op_list[i]
+                                if op["engine"] != engine:
+                                    continue
+                                writes = op["writes"]
+                                if writes and any(addr in used_writes for addr in writes):
+                                    continue
+                                engine_counts[engine] += 1
+                                if writes:
+                                    for addr in writes:
+                                        used_writes.add(addr)
+                                unscheduled.remove(i)
+                                scheduled_strict.add(i)
+                                candidates.remove(i)
+                                progressed = True
+                                if engine_counts[engine] >= slot_limits[engine]:
+                                    break
+                    if not scheduled_strict:
+                        # Deadlock guard: no schedulable ops left, avoid infinite loop
+                        raise RuntimeError(
+                            f"Scheduler deadlock with {len(unscheduled)} ops remaining"
+                        )
+                    scheduled_this_cycle = list(scheduled_strict)
 
                 done.update(scheduled_this_cycle)
+                for i in scheduled_this_cycle:
+                    op = op_list[i]
+                    instr.setdefault(op["engine"], []).append(op["slot"])
                 instrs.append(instr)
 
             return instrs
